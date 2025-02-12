@@ -1,0 +1,2788 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import cv2
+import rasterio
+import numpy as np
+from matplotlib import pyplot as plt
+import tifffile as tiff
+from PIL import Image
+from skimage.metrics import structural_similarity as ssim
+from scipy.stats import entropy
+
+# Function to register band using feature-based methods
+def register_band(ref_image, band_image, method):
+    if method == 'SIFT':
+        detector = cv2.SIFT_create()
+    elif method == 'ORB':
+        detector = cv2.ORB_create()
+    elif method == 'BRISK':
+        detector = cv2.BRISK_create()
+    elif method == 'KAZE':
+        detector = cv2.KAZE_create()
+    elif method == 'MSER':
+        # MSER detects regions; we need another method (like ORB) to compute descriptors
+        mser = cv2.MSER_create()
+        kp1 = mser.detect(ref_image)
+        kp2 = mser.detect(band_image)
+        # Use ORB to compute descriptors
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    else:
+        raise ValueError(f"Method {method} is not supported")
+
+    if method != 'MSER':  # MSER uses ORB for descriptors, others are handled here
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+
+    # Use a matcher based on method
+    if method in ['SIFT', 'KAZE']:
+        index_params = dict(algorithm=0, trees=5)
+        search_params = dict(checks=50)
+        matcher = cv2.FlannBasedMatcher(index_params, search_params)
+    else:
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    matches = matcher.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    matrix, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, matrix, (width, height))
+
+    return aligned_image
+
+
+# Function to save multi-channel image as a single TIFF file
+def save_multichannel_tiff(image_array, output_path):
+    """
+    Save a multi-channel image (e.g., 5-band image) as a single TIFF file.
+    
+    Parameters:
+    - image_array: A 3D NumPy array (height, width, channels) representing the stacked image.
+    - output_path: Path where the output TIFF image will be saved.
+    """
+    # Ensure the image array is a NumPy array and has multiple channels
+    if len(image_array.shape) != 3:
+        raise ValueError("Image array must be 3-dimensional (height, width, channels).")
+    
+    # Save the multi-channel image as a single TIFF file
+    tiff.imwrite(output_path, image_array, photometric='minisblack')  # photometric='rgb' for color images
+    #cv2.imwrite(output_tiff_path, stacked_image_uint8)
+    
+    print(f"Multi-channel image saved as {output_path}")
+
+
+# Error matrix calculation: MSE, SSIM, and Entropy between the registered and reference image
+def calculate_error_metrics(ref_image, aligned_image):
+    mse_value = np.mean((ref_image - aligned_image) ** 2)
+    ssim_value, _ = ssim(ref_image, aligned_image, full=True)
+    entropy_value = entropy(ref_image.flatten(), aligned_image.flatten())
+    return mse_value, ssim_value, entropy_value
+
+# ECC (Enhanced Correlation Coefficient) method
+def ecc_register(ref_image, band_image):
+    warp_matrix = np.eye(3, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-10)
+    cc, warp_matrix = cv2.findTransformECC(ref_image, band_image, warp_matrix, cv2.MOTION_HOMOGRAPHY, criteria)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, warp_matrix, (width, height), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    return aligned_image
+
+# CFOB (Correlation Feature-Based Registration) method using phase correlation
+def cfob_register(ref_image, band_image):
+    # Use Fourier Transform for phase correlation
+    # Calculate the phase correlation between the reference and band image
+    shift = cv2.phaseCorrelate(np.float32(ref_image), np.float32(band_image))
+    
+    # Shift the band image according to the correlation shift
+    matrix = np.float32([[1, 0, shift[0][0]], [0, 1, shift[0][1]]])
+    height, width = ref_image.shape
+    aligned_image = cv2.warpAffine(band_image, matrix, (width, height))
+    return aligned_image
+
+# DSIM (Dissimilarity-Based Image Matching) method using Mutual Information
+def dsim_register(ref_image, band_image):
+    # Compute the Mutual Information (MI) between the reference and band image
+    hist_2d, _, _ = np.histogram2d(ref_image.ravel(), band_image.ravel(), bins=20)
+    mi = mutual_information(hist_2d)
+    
+    # Warp based on MI (placeholder: using ECC for alignment)
+    return ecc_register(ref_image, band_image)
+
+# Mutual information calculation
+def mutual_information(hist_2d):
+    pxy = hist_2d / float(np.sum(hist_2d))  # Joint probability distribution
+    px = np.sum(pxy, axis=1)  # Marginal probability for x
+    py = np.sum(pxy, axis=0)  # Marginal probability for y
+    pxy_nonzero = pxy[np.nonzero(pxy)]  # Non-zero joint probabilities
+    px_py_nonzero = np.outer(px, py)[np.nonzero(pxy)]  # Non-zero product of marginals
+    mi = np.sum(pxy_nonzero * np.log(pxy_nonzero / px_py_nonzero))  # Mutual Information formula
+    return mi
+
+# Display RGB and FCC images
+def display_images(aligned_images, method):
+    blue = aligned_images[method][0]
+    green = aligned_images[method][1]
+    red = aligned_images[method][2]
+    nir = aligned_images[method][4]
+
+    # RGB (using Blue, Green, Red)
+    rgb_image = cv2.merge([blue, green, red])
+    rgb_image = cv2.normalize(rgb_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # FCC (False Color Composite using NIR, Red, Green)
+    fcc_image = cv2.merge([nir, red, green])
+    fcc_image = cv2.normalize(fcc_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Display RGB image
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.title(f"RGB Image using {method}")
+    plt.imshow(cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB))
+
+    # Display FCC image
+    plt.subplot(1, 2, 2)
+    plt.title(f"FCC Image using {method}")
+    plt.imshow(cv2.cvtColor(fcc_image, cv2.COLOR_BGR2RGB))
+    plt.show()
+    
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+rededge = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+
+# Define the reference image (use the Red band as the reference in this case)
+ref_image = rededge  # Change to another band if necessary (e.g., nir)
+
+# Methods for registration
+methods = ['SIFT', 'ORB', 'BRISK', 'KAZE', 'MSER', 'ECC', 'CFOB', 'DSIM']
+aligned_images = {}
+
+# Output directory path
+output_directory = 'C:\\Users\\BDL\\Desktop\\pots\\Results\\'  # Change to your directory path
+
+# Example usage inside your loop
+for method in methods:
+    print(f"Registering bands using {method} method")
+    
+    # Perform registration using the appropriate method
+    if method == 'ECC':
+        try:
+            aligned_images[method] = [ecc_register(ref_image, blue),
+                                      ecc_register(ref_image, green),
+                                      ecc_register(ref_image, red),
+                                      ref_image,
+                                      ecc_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping ECC registration for {method} due to error: {e}")
+            continue
+    elif method == 'CFOB':
+        try:
+            aligned_images[method] = [cfob_register(ref_image, blue),
+                                      cfob_register(ref_image, green),
+                                      cfob_register(ref_image, red),
+                                      ref_image,
+                                      cfob_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping CFOB registration for {method} due to error: {e}")
+            continue
+    elif method == 'DSIM':
+        try:
+            aligned_images[method] = [dsim_register(ref_image, blue),
+                                      dsim_register(ref_image, green),
+                                      dsim_register(ref_image, red),
+                                      ref_image,
+                                      dsim_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping DSIM registration for {method} due to error: {e}")
+            continue
+    else:
+        try:
+            aligned_images[method] = [register_band(ref_image, blue, method),
+                                      register_band(ref_image, green, method),
+                                      register_band(ref_image, red, method),
+                                      ref_image,
+                                      register_band(ref_image, nir, method)]
+        except ValueError as e:
+            print(f"Skipping {method} registration due to error: {e}")
+            continue
+
+    # Ensure the channels are stacked in the correct order: Blue, Green, Red, RedEdge, NIR
+    stacked_image = np.stack([aligned_images[method][0],  # Blue
+                              aligned_images[method][1],  # Green
+                              aligned_images[method][2],  # Red
+                              aligned_images[method][3],  # RedEdge
+                              aligned_images[method][4]], axis=-1)  # NIR
+
+   
+    #Save the stacked image for each method
+    output_tiff_path = f'{output_directory}/{method}_stackedimage.tif'
+#     save_multichannel_tiff(stacked_image, output_tiff_path)
+
+    # Save the stacked image using Rasterio
+    with rasterio.open(
+        output_tiff_path, 
+        'w', 
+        driver='GTiff', 
+        height=stacked_image.shape[0], 
+        width=stacked_image.shape[1], 
+        count=stacked_image.shape[2],  # 5 bands
+        dtype=stacked_image.dtype,     # Data type (e.g., uint8)
+        crs='+proj=latlong',            # Coordinate Reference System (optional)
+        transform=None                 # Geotransform (optional)
+    ) as dst:
+        for i in range(stacked_image.shape[2]):
+            dst.write(stacked_image[:, :, i], i + 1)  # Write each band to a separate channel
+
+    print(f"Multi-band TIFF image saved at {output_tiff_path}")
+
+
+    # Calculate error metrics for each band
+    for i, band_name in enumerate(['Blue', 'Green', 'Red', 'RedEdge', 'NIR']):
+        mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_images[method][i])
+        print(f"{method} - {band_name}: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+
+    # Display RGB and FCC images
+    display_images(aligned_images, method)
+
+
+# In[4]:
+
+
+# Replica +FAST
+
+import cv2
+import rasterio
+import numpy as np
+from matplotlib import pyplot as plt
+import tifffile as tiff
+from PIL import Image
+from skimage.metrics import structural_similarity as ssim
+from scipy.stats import entropy
+
+def register_band(ref_image, band_image, method):
+    if method == 'SIFT':
+        detector = cv2.SIFT_create()
+    elif method == 'ORB':
+        detector = cv2.ORB_create()
+    elif method == 'BRISK':
+        detector = cv2.BRISK_create()
+    elif method == 'KAZE':
+        detector = cv2.KAZE_create()
+    elif method == 'FAST':
+        # FAST is a keypoint detector, use ORB to compute descriptors
+        fast = cv2.FastFeatureDetector_create()
+        kp1 = fast.detect(ref_image, None)
+        kp2 = fast.detect(band_image, None)
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    elif method == 'HARRIS':
+        # Harris corner detection
+        harris = cv2.cornerHarris(ref_image, 2, 3, 0.04)
+        kp1 = np.argwhere(harris > 0.01 * harris.max())  # Corners detected in reference image
+        kp1 = [cv2.KeyPoint(float(p[1]), float(p[0]), 1) for p in kp1]  # Convert to keypoints
+
+        harris_band = cv2.cornerHarris(band_image, 2, 3, 0.04)
+        kp2 = np.argwhere(harris_band > 0.01 * harris_band.max())  # Corners detected in band image
+        kp2 = [cv2.KeyPoint(float(p[1]), float(p[0]), 1) for p in kp2]  # Convert to keypoints
+
+        # Use ORB to compute descriptors for Harris keypoints
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    elif method == 'MSER':
+        mser = cv2.MSER_create()
+        kp1 = mser.detect(ref_image)
+        kp2 = mser.detect(band_image)
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    else:
+        raise ValueError(f"Method {method} is not supported")
+
+    if method not in ['FAST', 'HARRIS', 'MSER']:  # FAST, HARRIS, and MSER handled separately
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+
+    # Use a matcher based on method
+    if method in ['SIFT', 'KAZE']:
+        index_params = dict(algorithm=0, trees=5)
+        search_params = dict(checks=50)
+        matcher = cv2.FlannBasedMatcher(index_params, search_params)
+    else:
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    matches = matcher.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    matrix, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, matrix, (width, height))
+
+    return aligned_image
+
+# Function to save multi-channel image as a single TIFF file
+def save_multichannel_tiff(image_array, output_path):
+    """
+    Save a multi-channel image (e.g., 5-band image) as a single TIFF file.
+    
+    Parameters:
+    - image_array: A 3D NumPy array (height, width, channels) representing the stacked image.
+    - output_path: Path where the output TIFF image will be saved.
+    """
+    # Ensure the image array is a NumPy array and has multiple channels
+    if len(image_array.shape) != 3:
+        raise ValueError("Image array must be 3-dimensional (height, width, channels).")
+    
+    # Save the multi-channel image as a single TIFF file
+    tiff.imwrite(output_path, image_array, photometric='minisblack')  # photometric='rgb' for color images
+    #cv2.imwrite(output_tiff_path, stacked_image_uint8)
+    
+    print(f"Multi-channel image saved as {output_path}")
+
+
+# Error matrix calculation: MSE, SSIM, and Entropy between the registered and reference image
+def calculate_error_metrics(ref_image, aligned_image):
+    mse_value = np.mean((ref_image - aligned_image) ** 2)
+    ssim_value, _ = ssim(ref_image, aligned_image, full=True)
+    entropy_value = entropy(ref_image.flatten(), aligned_image.flatten())
+    return mse_value, ssim_value, entropy_value
+
+# ECC (Enhanced Correlation Coefficient) method
+def ecc_register(ref_image, band_image):
+    warp_matrix = np.eye(3, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-10)
+    cc, warp_matrix = cv2.findTransformECC(ref_image, band_image, warp_matrix, cv2.MOTION_HOMOGRAPHY, criteria)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, warp_matrix, (width, height), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    return aligned_image
+
+# CFOB (Correlation Feature-Based Registration) method using phase correlation
+def cfob_register(ref_image, band_image):
+    # Use Fourier Transform for phase correlation
+    # Calculate the phase correlation between the reference and band image
+    shift = cv2.phaseCorrelate(np.float32(ref_image), np.float32(band_image))
+    
+    # Shift the band image according to the correlation shift
+    matrix = np.float32([[1, 0, shift[0][0]], [0, 1, shift[0][1]]])
+    height, width = ref_image.shape
+    aligned_image = cv2.warpAffine(band_image, matrix, (width, height))
+    return aligned_image
+
+# DSIM (Dissimilarity-Based Image Matching) method using Mutual Information
+def dsim_register(ref_image, band_image):
+    # Compute the Mutual Information (MI) between the reference and band image
+    hist_2d, _, _ = np.histogram2d(ref_image.ravel(), band_image.ravel(), bins=20)
+    mi = mutual_information(hist_2d)
+    
+    # Warp based on MI (placeholder: using ECC for alignment)
+    return ecc_register(ref_image, band_image)
+
+# Mutual information calculation
+def mutual_information(hist_2d):
+    pxy = hist_2d / float(np.sum(hist_2d))  # Joint probability distribution
+    px = np.sum(pxy, axis=1)  # Marginal probability for x
+    py = np.sum(pxy, axis=0)  # Marginal probability for y
+    pxy_nonzero = pxy[np.nonzero(pxy)]  # Non-zero joint probabilities
+    px_py_nonzero = np.outer(px, py)[np.nonzero(pxy)]  # Non-zero product of marginals
+    mi = np.sum(pxy_nonzero * np.log(pxy_nonzero / px_py_nonzero))  # Mutual Information formula
+    return mi
+
+# Display RGB and FCC images
+def display_images(aligned_images, method):
+    blue = aligned_images[method][0]
+    green = aligned_images[method][1]
+    red = aligned_images[method][2]
+    nir = aligned_images[method][4]
+
+    # RGB (using Blue, Green, Red)
+    rgb_image = cv2.merge([blue, green, red])
+    rgb_image = cv2.normalize(rgb_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # FCC (False Color Composite using NIR, Red, Green)
+    fcc_image = cv2.merge([nir, red, green])
+    fcc_image = cv2.normalize(fcc_image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Display RGB image
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.title(f"RGB Image using {method}")
+    plt.imshow(cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB))
+
+    # Display FCC image
+    plt.subplot(1, 2, 2)
+    plt.title(f"FCC Image using {method}")
+    plt.imshow(cv2.cvtColor(fcc_image, cv2.COLOR_BGR2RGB))
+    plt.show()
+    
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+rededge = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+
+# Define the reference image (use the Red band as the reference in this case)
+ref_image = rededge  # Change to another band if necessary (e.g., nir)
+
+# Methods for registration
+methods = ['SIFT', 'ORB', 'BRISK', 'KAZE', 'MSER', 'FAST', 'HARRIS', 'ECC', 'CFOB', 'DSIM']
+
+aligned_images = {}
+
+# Output directory path
+output_directory = 'C:\\Users\\BDL\\Desktop\\pots\\Results\\'  # Change to your directory path
+
+# Example usage inside your loop
+for method in methods:
+    print(f"Registering bands using {method} method")
+    
+    # Perform registration using the appropriate method
+    if method == 'ECC':
+        try:
+            aligned_images[method] = [ecc_register(ref_image, blue),
+                                      ecc_register(ref_image, green),
+                                      ecc_register(ref_image, red),
+                                      ref_image,
+                                      ecc_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping ECC registration for {method} due to error: {e}")
+            continue
+    elif method == 'CFOB':
+        try:
+            aligned_images[method] = [cfob_register(ref_image, blue),
+                                      cfob_register(ref_image, green),
+                                      cfob_register(ref_image, red),
+                                      ref_image,
+                                      cfob_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping CFOB registration for {method} due to error: {e}")
+            continue
+    elif method == 'DSIM':
+        try:
+            aligned_images[method] = [dsim_register(ref_image, blue),
+                                      dsim_register(ref_image, green),
+                                      dsim_register(ref_image, red),
+                                      ref_image,
+                                      dsim_register(ref_image, nir)]
+        except ValueError as e:
+            print(f"Skipping DSIM registration for {method} due to error: {e}")
+            continue
+    else:
+        try:
+            aligned_images[method] = [register_band(ref_image, blue, method),
+                                      register_band(ref_image, green, method),
+                                      register_band(ref_image, red, method),
+                                      ref_image,
+                                      register_band(ref_image, nir, method)]
+        except ValueError as e:
+            print(f"Skipping {method} registration due to error: {e}")
+            continue
+
+    # Ensure the channels are stacked in the correct order: Blue, Green, Red, RedEdge, NIR
+    stacked_image = np.stack([aligned_images[method][0],  # Blue
+                              aligned_images[method][1],  # Green
+                              aligned_images[method][2],  # Red
+                              aligned_images[method][3],  # RedEdge
+                              aligned_images[method][4]], axis=-1)  # NIR
+
+   
+    #Save the stacked image for each method
+    output_tiff_path = f'{output_directory}/{method}_stackedimage.tif'
+#     save_multichannel_tiff(stacked_image, output_tiff_path)
+
+    # Save the stacked image using Rasterio
+    with rasterio.open(
+        output_tiff_path, 
+        'w', 
+        driver='GTiff', 
+        height=stacked_image.shape[0], 
+        width=stacked_image.shape[1], 
+        count=stacked_image.shape[2],  # 5 bands
+        dtype=stacked_image.dtype,     # Data type (e.g., uint8)
+        crs='+proj=latlong',            # Coordinate Reference System (optional)
+        transform=None                 # Geotransform (optional)
+    ) as dst:
+        for i in range(stacked_image.shape[2]):
+            dst.write(stacked_image[:, :, i], i + 1)  # Write each band to a separate channel
+
+    print(f"Multi-band TIFF image saved at {output_tiff_path}")
+
+
+    # Calculate error metrics for each band
+    for i, band_name in enumerate(['Blue', 'Green', 'Red', 'RedEdge', 'NIR']):
+        mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_images[method][i])
+        print(f"{method} - {band_name}: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+
+    # Display RGB and FCC images
+    display_images(aligned_images, method)
+
+
+# In[8]:
+
+
+# multii model multi transformation (key points and error matrix and all band images)
+import cv2
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+import matplotlib.pyplot as plt
+
+# Helper function to display keypoints
+def display_keypoints(ref_image, band_image, kp1, kp2, method):
+    # Draw keypoints on the images
+    ref_kp_img = cv2.drawKeypoints(ref_image, kp1, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    band_kp_img = cv2.drawKeypoints(band_image, kp2, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    
+    # Show images with keypoints
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.title(f"Reference Keypoints - {method}")
+    plt.imshow(ref_kp_img, cmap='gray')
+    plt.subplot(1, 2, 2)
+    plt.title(f"Band Keypoints - {method}")
+    plt.imshow(band_kp_img, cmap='gray')
+    plt.show()
+
+# Helper function to calculate error metrics
+def calculate_error_metrics(ref_image, aligned_image):
+    mse = np.mean((ref_image - aligned_image) ** 2)
+    ssim_val = ssim(ref_image, aligned_image)
+    entropy_val = -np.sum(ref_image * np.log2(ref_image + 1e-10))  # Example of entropy calculation
+    return mse, ssim_val, entropy_val
+
+# Function to register image using ECC
+def register_ecc(ref_image, band_image):
+    warp_mode = cv2.MOTION_HOMOGRAPHY
+    warp_matrix = np.eye(3, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-10)
+    (cc, warp_matrix) = cv2.findTransformECC(ref_image, band_image, warp_matrix, warp_mode, criteria)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, warp_matrix, (width, height), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    return aligned_image
+
+# Function to register image using Optical Flow (CFOB)
+def register_optical_flow(ref_image, band_image):
+    lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    kp1 = cv2.goodFeaturesToTrack(ref_image, maxCorners=100, qualityLevel=0.01, minDistance=10)
+    kp2, status, err = cv2.calcOpticalFlowPyrLK(ref_image, band_image, kp1, None, **lk_params)
+    matrix, _ = cv2.estimateAffine2D(kp2, kp1)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpAffine(band_image, matrix, (width, height))
+    return aligned_image
+
+# Function to register image using DCIM
+def register_dcim(ref_image, band_image):
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(ref_image, None)
+    kp2, des2 = sift.detectAndCompute(band_image, None)
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    matrix, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, matrix, (width, height))
+    return aligned_image
+
+def register_band(ref_image, band_image, method, transform):
+    # Initialize keypoint detectors based on the method
+    if method == 'SIFT':
+        detector = cv2.SIFT_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'ORB':
+        detector = cv2.ORB_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'BRISK':
+        detector = cv2.BRISK_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'KAZE':
+        detector = cv2.KAZE_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+#     elif method == 'HARRIS':
+#         # Use Harris corner detector to find keypoints
+#         harris_corners = cv2.goodFeaturesToTrack(ref_image, 100, 0.01, 10)
+#         if harris_corners is not None:
+#             kp1 = [cv2.KeyPoint(x[0][0], x[0][1], 1) for x in harris_corners]
+#             kp2 = [cv2.KeyPoint(x[0][0], x[0][1], 1) for x in harris_corners]
+#         else:
+#             raise ValueError("No Harris corners detected.")
+
+        # Use ORB to compute descriptors for the detected keypoints
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    # Ensure des1 and des2 are not None
+    if des1 is None or des2 is None:
+        raise ValueError(f"Descriptors not found for method: {method}")
+
+    # Matching keypoints
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+
+    # Check if there are enough good matches for homography
+    if len(good_matches) < 4:
+        raise ValueError(f"Not enough matches found for {method} with {transform}. Only {len(good_matches)} matches found.")
+
+    # Extract good keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Choose the transformation type
+    if transform == 'homography':
+        matrix, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+        aligned_image = cv2.warpPerspective(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'affine':
+        matrix, _ = cv2.estimateAffine2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'projective':
+        matrix, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'similarity':
+        matrix, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+
+    return aligned_image, kp1, kp2
+
+# Main workflow
+methods = ['SIFT', 'ORB', 'BRISK', 'KAZE', 'ECC', 'CFOB', 'DCIM']
+transforms = ['homography', 'affine', 'projective', 'similarity']
+
+# Output directory path
+output_directory = 'C:\\Users\\BDL\\Desktop\\pots\\Results\\'  # Change to your directory path
+
+for method in methods:
+    if method in ['ECC', 'CFOB', 'DCIM']:
+        print(f"Processing with {method} method")
+
+        if method == 'ECC':
+            aligned_band = register_ecc(ref_image, blue)
+        elif method == 'CFOB':
+            aligned_band = register_optical_flow(ref_image, blue)
+        elif method == 'DCIM':
+            aligned_band = register_dcim(ref_image, blue)
+        
+        mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_band)
+        print(f"Metrics for {method}: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+        
+    else:
+        for transform in transforms:
+            print(f"Processing with {method} and {transform} transformation")
+            
+            aligned_band, kp1, kp2 = register_band(ref_image, blue, method, transform)
+            
+            display_keypoints(ref_image, blue, kp1, kp2, method)
+            
+            mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_band)
+            print(f"Metrics for {method} with {transform}: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+            
+    # Ensure the channels are stacked in the correct order: Blue, Green, Red, RedEdge, NIR
+    stacked_image = np.stack([aligned_images[method][0],  # Blue
+                              aligned_images[method][1],  # Green
+                              aligned_images[method][2],  # Red
+                              aligned_images[method][3],  # RedEdge
+                              aligned_images[method][4]], axis=-1)  # NIR
+   
+    #Save the stacked image for each method
+    output_tiff_path = f'{output_directory}/{method}_stackedimage.tif'
+#     save_multichannel_tiff(stacked_image, output_tiff_path)
+
+    # Save the stacked image using Rasterio
+    with rasterio.open(
+        output_tiff_path, 
+        'w', 
+        driver='GTiff', 
+        height=stacked_image.shape[0], 
+        width=stacked_image.shape[1], 
+        count=stacked_image.shape[2],  # 5 bands
+        dtype=stacked_image.dtype,     # Data type (e.g., uint8)
+        crs='+proj=latlong',            # Coordinate Reference System (optional)
+        transform=None                 # Geotransform (optional)
+    ) as dst:
+        for i in range(stacked_image.shape[2]):
+            dst.write(stacked_image[:, :, i], i + 1)  # Write each band to a separate channel
+
+    print(f"Multi-band TIFF image saved at {output_tiff_path}")
+
+
+    # Calculate error metrics for each band
+    for i, band_name in enumerate(['Blue', 'Green', 'Red', 'RedEdge', 'NIR']):
+        mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_images[method][i])
+        print(f"{method} - {band_name}: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+
+    # Display RGB and FCC images
+    display_images(aligned_images, method)
+
+
+# In[19]:
+
+
+# multii model multi transformation (key points and error matrix and single band transformation)
+import cv2
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+import matplotlib.pyplot as plt
+import rasterio
+
+# Helper function to display keypoints
+def display_keypoints(ref_image, band_image, kp1, kp2, method):
+    # Draw keypoints on the images
+    ref_kp_img = cv2.drawKeypoints(ref_image, kp1, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    band_kp_img = cv2.drawKeypoints(band_image, kp2, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    
+    # Show images with keypoints
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.title(f"Reference Keypoints - {method}")
+    plt.imshow(ref_kp_img, cmap='gray')
+    plt.subplot(1, 2, 2)
+    plt.title(f"Band Keypoints - {method}")
+    plt.imshow(band_kp_img, cmap='gray')
+    plt.show()
+
+# Helper function to calculate error metrics
+def calculate_error_metrics(ref_image, aligned_image):
+    mse = np.mean((ref_image - aligned_image) ** 2)
+    ssim_val = ssim(ref_image, aligned_image)
+    entropy_val = -np.sum(ref_image * np.log2(ref_image + 1e-10))  # Example of entropy calculation
+    return mse, ssim_val, entropy_val
+
+# Function to register image using ECC
+def register_ecc(ref_image, band_image):
+    warp_mode = cv2.MOTION_HOMOGRAPHY
+    warp_matrix = np.eye(3, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 5000, 1e-10)
+    (cc, warp_matrix) = cv2.findTransformECC(ref_image, band_image, warp_matrix, warp_mode, criteria)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, warp_matrix, (width, height), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    return aligned_image
+
+# Function to register image using Optical Flow (CFOB)
+def register_optical_flow(ref_image, band_image):
+    lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    kp1 = cv2.goodFeaturesToTrack(ref_image, maxCorners=100, qualityLevel=0.01, minDistance=10)
+    kp2, status, err = cv2.calcOpticalFlowPyrLK(ref_image, band_image, kp1, None, **lk_params)
+    matrix, _ = cv2.estimateAffine2D(kp2, kp1)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpAffine(band_image, matrix, (width, height))
+    return aligned_image
+
+# Function to register image using DCIM
+def register_dcim(ref_image, band_image):
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(ref_image, None)
+    kp2, des2 = sift.detectAndCompute(band_image, None)
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    matrix, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+    height, width = ref_image.shape
+    aligned_image = cv2.warpPerspective(band_image, matrix, (width, height))
+    return aligned_image
+
+def register_band(ref_image, band_image, method, transform):
+    # Initialize keypoint detectors based on the method
+    if method == 'SIFT':
+        detector = cv2.SIFT_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'ORB':
+        detector = cv2.ORB_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'BRISK':
+        detector = cv2.BRISK_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'KAZE':
+        detector = cv2.KAZE_create()
+        kp1, des1 = detector.detectAndCompute(ref_image, None)
+        kp2, des2 = detector.detectAndCompute(band_image, None)
+    elif method == 'HARRIS':
+        # Harris does not provide descriptors, so we will use ORB for descriptors
+        kp1_harris = cv2.goodFeaturesToTrack(ref_image, 100, 0.01, 10)
+        kp2_harris = cv2.goodFeaturesToTrack(band_image, 100, 0.01, 10)
+        kp1 = [cv2.KeyPoint(x[0][0], x[0][1], 1) for x in kp1_harris]
+        kp2 = [cv2.KeyPoint(x[0][0], x[0][1], 1) for x in kp2_harris]
+        # Use ORB to compute descriptors for Harris keypoints
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.compute(ref_image, kp1)
+        kp2, des2 = orb.compute(band_image, kp2)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    # Check if descriptors were successfully computed
+    if des1 is None or des2 is None:
+        print(f"Descriptors could not be computed for method {method}. Skipping...")
+        return band_image, [], []  # Return the original band image and empty keypoints
+
+    # Matching keypoints
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+
+    # Check if we have enough matches
+    if len(good_matches) < 4:
+        print(f"Not enough matches found for {method} with {transform}. Skipping this band.")
+        return band_image, [], []  # Return the original band image as fallback
+
+    # Extract good keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    # Choose the transformation type
+    if transform == 'homography':
+        matrix, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+        aligned_image = cv2.warpPerspective(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'affine':
+        matrix, _ = cv2.estimateAffine2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'projective':
+        matrix, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+    elif transform == 'similarity':
+        matrix, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts)
+        aligned_image = cv2.warpAffine(band_image, matrix, (ref_image.shape[1], ref_image.shape[0]))
+
+    return aligned_image, kp1, kp2
+
+# Function to save the multi-channel TIFF image
+def save_stacked_image(stacked_image, output_tiff_path):
+    with rasterio.open(
+        output_tiff_path, 
+        'w', 
+        driver='GTiff', 
+        height=stacked_image.shape[0], 
+        width=stacked_image.shape[1], 
+        count=stacked_image.shape[2],  # 5 bands
+        dtype=stacked_image.dtype,     # Data type (e.g., uint8)
+        crs='+proj=latlong',           # Coordinate Reference System (optional)
+        transform=None                 # Geotransform (optional)
+    ) as dst:
+        for i in range(stacked_image.shape[2]):
+            dst.write(stacked_image[:, :, i], i + 1)  # Write each band to a separate channel
+
+    print(f"Multi-band TIFF image saved at {output_tiff_path}")
+
+
+# Main workflow
+methods = ['SIFT', 'ORB', 'BRISK', 'KAZE', 'HARRIS', 'ECC', 'CFOB', 'DCIM']
+transforms = ['homography', 'affine', 'projective', 'similarity']
+bands = ['Blue', 'Green', 'Red', 'NIR']  # List of bands
+aligned_images = {method: [] for method in methods}  # Dictionary to store aligned images
+
+# # Placeholder images (load your actual images here)
+# ref_image = load_image('RedEdge_image.png')
+# blue = load_image('Blue_band.png')
+# green = load_image('Green_band.png')
+# red = load_image('Red_band.png')
+# nir = load_image('NIR_band.png')
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+ref_image = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+
+# # Define the reference image (use the Red band as the reference in this case)
+# ref_image = rededge  # Change to another band if necessary (e.g., nir)
+# # Load images and ensure they are valid
+# def load_image(image_path):
+#     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+#     if image is None or image.size == 0:
+#         raise ValueError(f"Error: Could not load image at {image_path}. Please check the file.")
+#     return image
+
+band_images = [blue, green, red, nir]
+
+# Output directory path
+output_directory = 'C:\\Users\\BDL\\Desktop\\pots\\Results1\\'  # Change to your directory path
+
+# for method in methods:
+#     for i, band_image in enumerate(band_images):
+#         if method in ['ECC', 'CFOB', 'DCIM']:
+#             if method == 'ECC':
+#                 aligned_band = register_ecc(ref_image, band_image)
+#             elif method == 'CFOB':
+#                 aligned_band = register_optical_flow(ref_image, band_image)
+#             elif method == 'DCIM':
+#                 aligned_band = register_dcim(ref_image, band_image)
+#         else:
+#             for transform in transforms:
+#                 aligned_band, kp1, kp2 = register_band(ref_image, band_image, method, transform)
+#                 display_keypoints(ref_image, band_image, kp1, kp2, method)
+
+#         aligned_images[method].append(aligned_band)
+        
+#         mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_band)
+#         print(f"{method} - {bands[i]} Band: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+
+for method in methods:
+    for i, band_image in enumerate(band_images):
+        if method in ['ECC', 'CFOB', 'DCIM']:
+            if method == 'ECC':
+                aligned_band = register_ecc(ref_image, band_image)
+            elif method == 'CFOB':
+                aligned_band = register_optical_flow(ref_image, band_image)
+            elif method == 'DCIM':
+                aligned_band = register_dcim(ref_image, band_image)
+        else:
+            for transform in transforms:
+                aligned_band, kp1, kp2 = register_band(ref_image, band_image, method, transform)
+                if len(kp1) == 0 or len(kp2) == 0:  # Skip if no keypoints were matched
+                    continue
+                display_keypoints(ref_image, band_image, kp1, kp2, method)
+
+        aligned_images[method].append(aligned_band)
+        
+        mse, ssim_val, entropy_val = calculate_error_metrics(ref_image, aligned_band)
+        print(f"{method} - {bands[i]} Band: MSE={mse:.4f}, SSIM={ssim_val:.4f}, Entropy={entropy_val:.4f}")
+
+    # Ensure the channels are stacked in the correct order
+    stacked_image = np.stack([aligned_images[method][0], aligned_images[method][1], aligned_images[method][2], aligned_images[method][3]], axis=-1)
+
+    # Save the stacked image for each method
+    output_tiff_path = f'{output_directory}/{method}_stacked_image.tif'
+    save_stacked_image(stacked_image, output_tiff_path)
+
+
+# In[16]:
+
+
+# SWIFT model
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.transform import from_origin
+
+# Function to detect keypoints and descriptors using SIFT
+def sift_keypoints_descriptors(img):
+    sift = cv2.SIFT_create()
+    keypoints, descriptors = sift.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors between two images
+def match_features(des1, des2):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    return matches
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to apply transformation using keypoints and matches
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    # Extract matching keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    # Choose transformation
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    return aligned_img
+
+# Function to compute RMSE between two images
+def compute_rmse(img1, img2):
+    return np.sqrt(np.mean((img1.astype(np.float32) - img2.astype(np.float32)) ** 2))
+
+# Function to save the aligned bands as a stacked TIFF using rasterio
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    # Define the output GeoTIFF's metadata
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)  # Example georeferencing; modify based on your data
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,  # 5 bands (Blue, Green, Red, RedEdge, NIR)
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        # Write each band
+        dst.write(blue, 1)      # Band 1: Blue
+        dst.write(green, 2)     # Band 2: Green
+        dst.write(red, 3)       # Band 3: Red
+        dst.write(red_edge, 4)  # Band 4: RedEdge
+        dst.write(nir, 5)       # Band 5: NIR
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# List of images and their names
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Store aligned images for each transformation type
+aligned_images = {
+    'homography': [],
+    'affine': [],
+    'projective': [],
+    'similarity': []
+}
+
+# Perform SIFT detection and matching for each image
+for i, img in enumerate(band_images):
+    print(f"\nProcessing {image_names[i]} band...")
+    
+    # Detect keypoints and descriptors
+    kp1, des1 = sift_keypoints_descriptors(img)
+    kp2, des2 = sift_keypoints_descriptors(ref_img)
+    
+    # Display the keypoints
+    draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+    draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+    # Match features
+    matches = match_features(des1, des2)
+    print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+    
+    # Draw and display matches
+    draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+    # Apply transformations and calculate RMSE
+    for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+        aligned_img = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+        aligned_images[transformation_type].append(aligned_img)
+        
+        # Compute and print RMSE
+        rmse = compute_rmse(aligned_img, ref_img)
+        print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+        # Optionally, you can display the transformed image alongside the reference for visual inspection
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(ref_img, cmap='gray')
+        plt.title("Reference (RedEdge)")
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(aligned_img, cmap='gray')
+        plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+        
+        plt.show()
+        
+# Now save the images for each transformation as TIFF files
+save_as_rasterio_tiff(
+    aligned_images['homography'][0],  # Aligned Blue
+    aligned_images['homography'][1],  # Aligned Green
+    aligned_images['homography'][2],  # Aligned Red
+    ref_img,                          # RedEdge (reference image)
+    aligned_images['homography'][3],  # Aligned NIR
+    'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_homography.tif'
+)
+
+save_as_rasterio_tiff(
+    aligned_images['affine'][0],  # Aligned Blue
+    aligned_images['affine'][1],  # Aligned Green
+    aligned_images['affine'][2],  # Aligned Red
+    ref_img,                      # RedEdge (reference image)
+    aligned_images['affine'][3],  # Aligned NIR
+    'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_affine.tif'
+)
+
+save_as_rasterio_tiff(
+    aligned_images['projective'][0],  # Aligned Blue
+    aligned_images['projective'][1],  # Aligned Green
+    aligned_images['projective'][2],  # Aligned Red
+    ref_img,                          # RedEdge (reference image)
+    aligned_images['projective'][3],  # Aligned NIR
+    'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_projective.tif'
+)
+
+save_as_rasterio_tiff(
+    aligned_images['similarity'][0],  # Aligned Blue
+    aligned_images['similarity'][1],  # Aligned Green
+    aligned_images['similarity'][2],  # Aligned Red
+    ref_img,                          # RedEdge (reference image)
+    aligned_images['similarity'][3],  # Aligned NIR
+    'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_similarity.tif'
+)
+
+
+# In[17]:
+
+
+# modified and default SWIFT values
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# SIFT with customizable parameters
+def sift_keypoints_descriptors(img, nfeatures=0, nOctaveLayers=3, contrastThreshold=0.04, edgeThreshold=10, sigma=1.6):
+    sift = cv2.SIFT_create(
+        nfeatures=nfeatures,
+        nOctaveLayers=nOctaveLayers,
+        contrastThreshold=contrastThreshold,
+        edgeThreshold=edgeThreshold,
+        sigma=sigma
+    )
+    keypoints, descriptors = sift.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to apply transformation
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    return aligned_img
+
+# SIFT with customizable parameters
+def sift_keypoints_descriptors(img, nfeatures=0, nOctaveLayers=3, contrastThreshold=0.04, edgeThreshold=10, sigma=1.6):
+    sift = cv2.SIFT_create(
+        nfeatures=nfeatures,
+        nOctaveLayers=nOctaveLayers,
+        contrastThreshold=contrastThreshold,
+        edgeThreshold=edgeThreshold,
+        sigma=sigma
+    )
+    keypoints, descriptors = sift.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    return aligned_img
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable parameters for SIFT and max_matches
+def process_bands(band_images, ref_img, image_names, max_matches=1500, sift_params=None):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    # Default SIFT parameters if not provided
+    if sift_params is None:
+        # Default values
+        sift_params = {
+            'nfeatures': 0,
+            'nOctaveLayers': 3,
+            'contrastThreshold': 0.04,
+            'edgeThreshold': 10,
+            'sigma': 1.6
+        }
+        # modified values
+#         sift_params = {
+#             'nfeatures': 1500,  # Increase the maximum number of features to 1500
+#             'nOctaveLayers': 6,  # Increase the number of layers in each octave
+#             'contrastThreshold': 0.01,  # Decrease the contrast threshold to detect more features
+#             'edgeThreshold': 6,  # Lower the edge threshold to detect more edge-like features
+#             'sigma': 1.4  # Modify Gaussian blur applied to input image
+#         }
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors
+        kp1, des1 = sift_keypoints_descriptors(img)
+        kp2, des2 = sift_keypoints_descriptors(ref_img)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Optionally, you can display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# List of images and their names
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Process the bands with custom SIFT parameters and increased max_matches
+aligned_images = process_bands(band_images, ref_img, image_names, max_matches=1500, sift_params=sift_params)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\test_similarity.tif')
+
+
+
+# In[5]:
+
+
+#only SIFT with Inliners and RMSE
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# SIFT with customizable parameters
+def sift_keypoints_descriptors(img, nfeatures=0, nOctaveLayers=3, contrastThreshold=0.04, edgeThreshold=10, sigma=1.6):
+    sift = cv2.SIFT_create(
+        nfeatures=nfeatures,
+        nOctaveLayers=nOctaveLayers,
+        contrastThreshold=contrastThreshold,
+        edgeThreshold=edgeThreshold,
+        sigma=sigma
+    )
+    keypoints, descriptors = sift.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable parameters for SIFT and max_matches
+def process_bands(band_images, ref_img, image_names, max_matches=1500, sift_params=None):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    # Default SIFT parameters if not provided
+    if sift_params is None:
+        sift_params = {
+            'nfeatures': 0,
+            'nOctaveLayers': 3,
+            'contrastThreshold': 0.04,
+            'edgeThreshold': 10,
+            'sigma': 1.6
+        }
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors
+        kp1, des1 = sift_keypoints_descriptors(img, **sift_params)
+        kp2, des2 = sift_keypoints_descriptors(ref_img, **sift_params)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b1_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b2_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b3_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b4_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b5_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_5.tif', cv2.IMREAD_GRAYSCALE)
+
+blue = cv2.imread('C:\\Tarun\\rotated_histogram\\georeferenced_IMG_0606_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Tarun\\rotated_histogram\\georeferenced_IMG_0606_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Tarun\\rotated_histogram\\georeferenced_IMG_0606_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Tarun\\rotated_histogram\\georeferenced_IMG_0606_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Tarun\\rotated_histogram\\georeferenced_IMG_0606_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+
+# List of images and their names
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Process the bands with custom SIFT parameters and increased max_matches
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500, sift_params=None)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\SIFT_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\SIFT_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\SIFT_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\SIFT_similarity.tif')
+
+
+# In[62]:
+
+
+## BIRSK model
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Correct BRISK with appropriate parameters
+def brisk_keypoints_descriptors(img, thresh=30, octaves=3, pattern_scale=1.0):
+    brisk = cv2.BRISK_create(thresh, octaves, pattern_scale)
+    keypoints, descriptors = brisk.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches and BRISK params
+def process_bands(band_images, ref_img, image_names, max_matches=1500, brisk_params=None):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    # Default BRISK parameters if not provided
+    if brisk_params is None:
+        brisk_params = {
+            'thresh': 30,
+            'octaves': 3,
+            'pattern_scale': 1.0
+        }
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors
+        kp1, des1 = brisk_keypoints_descriptors(img, **brisk_params)
+        kp2, des2 = brisk_keypoints_descriptors(ref_img, **brisk_params)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Call the function with adjustable max_matches and BRISK params
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\BIRSK_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\BIRSK_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\BIRSK_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\BIRSK_similarity.tif')
+
+
+# In[83]:
+
+
+## MSER Method
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Correct MSER with appropriate parameters
+def mser_keypoints_descriptors(img):
+    mser = cv2.MSER_create()
+    keypoints = mser.detect(img, None)
+    # Use ORB to compute descriptors for the detected keypoints
+    orb = cv2.ORB_create()
+    keypoints, descriptors = orb.compute(img, keypoints)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches and MSER params
+def process_bands(band_images, ref_img, image_names, max_matches=1500):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors using MSER
+        kp1, des1 = mser_keypoints_descriptors(img)
+        kp2, des2 = mser_keypoints_descriptors(ref_img)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Call the function with adjustable max_matches
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1],
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\MSER_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1],
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\MSER_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1],
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\MSER_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1],
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\MSER_similarity.tif')
+
+print("Processing complete. Aligned images saved as TIFF.")
+
+
+# In[84]:
+
+
+# FAST model
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Correct FAST keypoint detection with ORB for descriptors
+def fast_keypoints_descriptors(img, threshold=30, nonmaxSuppression=True):
+    # Detect keypoints using FAST
+    fast = cv2.FastFeatureDetector_create(threshold, nonmaxSuppression)
+    keypoints = fast.detect(img, None)
+    
+    # Use ORB to compute descriptors for the detected keypoints
+    orb = cv2.ORB_create()
+    keypoints, descriptors = orb.compute(img, keypoints)
+    
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches and FAST params
+def process_bands(band_images, ref_img, image_names, max_matches=1500, fast_params=None):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    # Default FAST parameters if not provided
+    if fast_params is None:
+        fast_params = {
+            'threshold': 30,
+            'nonmaxSuppression': True
+        }
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors
+        kp1, des1 = fast_keypoints_descriptors(img, **fast_params)
+        kp2, des2 = fast_keypoints_descriptors(ref_img, **fast_params)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Call the function with adjustable max_matches and FAST params
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\FAST_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\FAST_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\FAST_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\FAST_similarity.tif')
+
+
+# In[85]:
+
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Correct KAZE keypoint detection and descriptor extraction
+def kaze_keypoints_descriptors(img):
+    # Create KAZE object and detect keypoints and descriptors
+    kaze = cv2.KAZE_create()
+    keypoints, descriptors = kaze.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches
+def process_bands(band_images, ref_img, image_names, max_matches=1500):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors using KAZE
+        kp1, des1 = kaze_keypoints_descriptors(img)
+        kp2, des2 = kaze_keypoints_descriptors(ref_img)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Call the function with adjustable max_matches
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\KAZE_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\KAZE_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\KAZE_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\KAZE_similarity.tif')
+
+
+# In[1]:
+
+
+#ORB Model
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# ORB keypoint detection and descriptor extraction
+def orb_keypoints_descriptors(img):
+    # Create ORB object and detect keypoints and descriptors
+    orb = cv2.ORB_create(nfeatures=2000)  # You can adjust nfeatures as needed
+    keypoints, descriptors = orb.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)  # Use NORM_HAMMING for ORB descriptors
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches
+def process_bands(band_images, ref_img, image_names, max_matches=1500):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors using ORB
+        kp1, des1 = orb_keypoints_descriptors(img)
+        kp2, des2 = orb_keypoints_descriptors(ref_img)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+blue = cv2.imread('C:\\Tarun\\mosaics\\Mosaic_Blue.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Tarun\\mosaics\\Mosaic_Green.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Tarun\\mosaics\\Mosaic_Red.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Tarun\\mosaics\\Mosaic_RedEdge.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Tarun\\mosaics\\Mosaic_NIR.tif', cv2.IMREAD_GRAYSCALE)  # RedEdge image as the reference
+
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Call the function with adjustable max_matches
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\ORB_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\ORB_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\ORB_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\ORB_similarity.tif')
+
+
+# In[87]:
+
+
+# HARRIS model
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Harris Corner Detection for keypoints
+def harris_keypoints(img, block_size=2, ksize=3, k=0.04):
+    # Harris corner detection
+    gray = np.float32(img)
+    dst = cv2.cornerHarris(gray, block_size, ksize, k)
+
+    # Normalizing and extracting keypoints
+    dst = cv2.dilate(dst, None)
+    keypoints = np.argwhere(dst > 0.01 * dst.max())  # Threshold to get strong corners
+
+    # Convert corner points to OpenCV Keypoint objects
+    keypoints = [cv2.KeyPoint(float(p[1]), float(p[0]), 1) for p in keypoints]
+    
+    return keypoints
+
+# Function to extract descriptors using ORB
+def orb_descriptors(img, keypoints):
+    # Create ORB object to compute descriptors for Harris keypoints
+    orb = cv2.ORB_create()
+    keypoints, descriptors = orb.compute(img, keypoints)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)  # Use NORM_HAMMING for ORB descriptors
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+# Function to apply transformation and get inlier percentage
+def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'projective':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+    
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+    return aligned_img, inlier_percentage
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Main logic with adjustable max_matches
+def process_bands(band_images, ref_img, image_names, max_matches=1500):
+    aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints using Harris Corner Detection
+        kp1 = harris_keypoints(img)
+        kp2 = harris_keypoints(ref_img)
+
+        # Extract descriptors using ORB for the detected Harris keypoints
+        kp1, des1 = orb_descriptors(img, kp1)
+        kp2, des2 = orb_descriptors(ref_img, kp2)
+
+        # Display the keypoints
+        draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints (Harris)')
+        draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints (Harris)')
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+        print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+        # Draw and display matches
+        draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band (Harris + ORB)')
+
+        # Apply transformations and calculate RMSE and inlier percentage
+        for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+            aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+            # Compute and print RMSE
+            rmse = calculate_rmse(aligned_img, ref_img)
+            print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+            # Display the transformed image alongside the reference for visual inspection
+            plt.figure(figsize=(10, 5))
+            plt.subplot(1, 2, 1)
+            plt.imshow(ref_img, cmap='gray')
+            plt.title("Reference (RedEdge)")
+
+            plt.subplot(1, 2, 2)
+            plt.imshow(aligned_img, cmap='gray')
+            plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+            plt.show()
+
+    return aligned_images, inlier_percentages
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Process each band, aligning it to the RedEdge band using Harris + ORB
+aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1000)
+
+# Save the aligned images to TIFF files
+save_as_rasterio_tiff(aligned_images['homography'][0], aligned_images['homography'][1], 
+                      aligned_images['homography'][2], ref_img, aligned_images['homography'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\Harris_ORB_homography.tif')
+
+save_as_rasterio_tiff(aligned_images['affine'][0], aligned_images['affine'][1], 
+                      aligned_images['affine'][2], ref_img, aligned_images['affine'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\Harris_ORB_affine.tif')
+
+save_as_rasterio_tiff(aligned_images['projective'][0], aligned_images['projective'][1], 
+                      aligned_images['projective'][2], ref_img, aligned_images['projective'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\Harris_ORB_projective.tif')
+
+save_as_rasterio_tiff(aligned_images['similarity'][0], aligned_images['similarity'][1], 
+                      aligned_images['similarity'][2], ref_img, aligned_images['similarity'][3], 
+                      'C:\\Users\\BDL\\Desktop\\pots\\Results\\Harris_ORB_similarity.tif')
+
+
+
+# In[15]:
+
+
+# Load the 5 band images (Blue, Green, Red, RedEdge, NIR)
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Highdepth\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Lowdepth\\IMG_0004_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Front\\Hightop\\IMG_0016_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0003_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0003_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0003_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0003_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\largespread\\IMG_0003_5.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b1_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b2_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b3_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b4_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\b5_sub_tif.tif', cv2.IMREAD_GRAYSCALE)
+
+# blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_1.tif', cv2.IMREAD_GRAYSCALE)
+# green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_2.tif', cv2.IMREAD_GRAYSCALE)
+# red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_3.tif', cv2.IMREAD_GRAYSCALE)
+# nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_4.tif', cv2.IMREAD_GRAYSCALE)
+# ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\IMG_0001_5.tif', cv2.IMREAD_GRAYSCALE)
+
+blue = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_1.tif', cv2.IMREAD_GRAYSCALE)
+green = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_2.tif', cv2.IMREAD_GRAYSCALE)
+red = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_3.tif', cv2.IMREAD_GRAYSCALE)
+nir = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_4.tif', cv2.IMREAD_GRAYSCALE)
+ref_img = cv2.imread('C:\\Users\\BDL\\Desktop\\pots\\Panel\\onemeter\\IMG_0000_5.tif', cv2.IMREAD_GRAYSCALE)
+
+
+# List of images and their names
+band_images = [blue, green, red, ref_img, nir]
+#image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+# Save the aligned images as stacked TIFFs
+save_as_rasterio_tiff(band_images[0], band_images[1], 
+                      band_images[2], band_images[3], band_images[4], 
+                       'C:\\Users\\BDL\\Desktop\\pots\\Side\\smallspread\\1\\original_stack_flat.tif')
+                      #'C:\\Users\\BDL\\Desktop\\pots\\Results\\original_stack.tif')
+
+
+# In[ ]:
+
+
+
+
