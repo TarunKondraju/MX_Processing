@@ -1,0 +1,1376 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[2]:
+
+
+## reads metadata
+
+import os
+import csv
+from exiftool import ExifTool
+
+def extract_all_metadata(image_path):
+    """
+    Extract all metadata from an image using ExifTool.
+    Args:
+        image_path (str): Path to the image file.
+    Returns:
+        dict: Dictionary of all metadata key-value pairs.
+    """
+    with ExifTool() as et:
+        metadata = et.get_metadata(image_path)  # Collect all available metadata
+    return metadata
+
+def save_all_metadata_to_csv(image_folder, output_csv_path):
+    """
+    Extract all metadata from images in a folder and save to a CSV file.
+    Args:
+        image_folder (str): Folder containing the images.
+        output_csv_path (str): Path to save the metadata CSV file.
+    """
+    if not os.path.exists(os.path.dirname(output_csv_path)):
+        os.makedirs(os.path.dirname(output_csv_path))
+
+    # Collect metadata from all images
+    metadata_list = []
+    for filename in os.listdir(image_folder):
+        if filename.lower().endswith(('.tif', '.jpg', '.png')):  # Adjust extensions as needed
+            image_path = os.path.join(image_folder, filename)
+            metadata = extract_all_metadata(image_path)
+            metadata['SourceFile'] = filename  # Add filename for reference
+            metadata_list.append(metadata)
+
+    # Determine all unique keys (to handle missing fields in some images)
+    all_keys = set()
+    for metadata in metadata_list:
+        all_keys.update(metadata.keys())
+    
+    # Write metadata to a CSV file
+    with open(output_csv_path, mode='w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=sorted(all_keys))  # Sort keys for consistent columns
+        writer.writeheader()
+        for metadata in metadata_list:
+            writer.writerow(metadata)
+
+    print(f"Metadata saved to {output_csv_path}")
+
+# Example usage
+image_folder = r"C:\Tarun\CIFA_ponds\0000SET\Cifa_40\data\images"  # Folder containing histogram-corrected images
+#output_csv_path = r"C:\Tarun\metadata\all_image_metadata1.csv"
+output_csv_path = r"C:\Tarun\CIFA_ponds\0000SET\Cifa_40\data\metadata\all_image_metadata1.csv"
+
+save_all_metadata_to_csv(image_folder, output_csv_path)
+
+
+# In[ ]:
+
+
+## Reads images, radiometric calibration
+
+import os
+import cv2
+import numpy as np
+from exiftool import ExifTool
+
+# Panel Calibration values
+panelCalibration = {
+    "Blue": 0.52,
+    "Green": 0.53,
+    "Red": 0.53,
+    "Red edge": 0.53,
+    "NIR": 0.53
+}
+
+# Global variables for bounding box
+drawing = False
+ix, iy = -1, -1
+rectangle = None
+
+def extract_metadata(filepath):
+    """Extracts required metadata using ExifTool."""
+    with ExifTool() as et:
+        metadata = et.get_metadata(filepath)
+    return metadata
+
+def vignette_map(meta, x_dim, y_dim):
+    """Computes the vignette correction map from metadata."""
+    x, y = np.meshgrid(np.arange(x_dim), np.arange(y_dim))
+    x = x.T
+    y = y.T
+
+    vignetting_center_size = len(meta.get("XMP:VignettingCenter", []))
+    vignetting_polynomial_2d_size = len(meta.get("XMP:VignettingPolynomial2D", []))
+
+    if vignetting_center_size > 0:
+        x_vignette = float(meta['XMP:VignettingCenter'][0])
+        y_vignette = float(meta['XMP:VignettingCenter'][1])
+        vignette_poly = list(map(float, meta['XMP:VignettingPolynomial']))
+        vignette_poly.reverse()
+        vignette_poly.append(1.0)
+        r = np.hypot(x - x_vignette, y - y_vignette)
+        vignette = 1.0 / np.polyval(vignette_poly, r)
+
+    elif vignetting_polynomial_2d_size > 0:
+        xv = x.T / x_dim
+        yv = y.T / y_dim
+        coeffs = meta['XMP:VignettingPolynomial2D']
+        exponents = meta['XMP:VignettingPolynomial2DExponents']
+        vignette = np.zeros_like(xv, dtype=float)
+        for i, c in enumerate(coeffs):
+            ex = exponents[2 * i]
+            ey = exponents[2 * i + 1]
+            vignette += c * xv**ex * yv**ey
+        vignette = 1.0 / vignette.T
+    else:
+        raise ValueError("No valid vignette correction data found in metadata.")
+
+    return vignette, x, y
+
+def raw_image_to_radiance(meta, image_raw):
+    """Converts raw DN image to radiance."""
+    a1, a2, a3 = [float(val) for val in meta['XMP:RadiometricCalibration']]
+    black_levels = [float(val) for val in meta['EXIF:BlackLevel'].split(' ')]
+    dark_level = np.mean(black_levels)
+    exposure_time = float(meta['EXIF:ExposureTime'])
+    gain = float(meta['EXIF:ISOSpeed']) / 100.0
+
+    x_dim, y_dim = image_raw.shape
+    V, x, y = vignette_map(meta, x_dim, y_dim)
+    R = 1.0 / (1.0 + a2 * y / exposure_time - a3 * y)
+    L = V * R * (image_raw - dark_level)
+    L[L < 0] = 0
+
+    bits_per_pixel = int(meta['EXIF:BitsPerSample'])
+    bit_depth_max = float(2 ** bits_per_pixel)
+    radiance_image = L.astype(float) / (gain * exposure_time) * a1 / bit_depth_max
+
+    return radiance_image
+
+def process_images_to_radiance(folder_path, output_folder):
+    """Processes images to compute radiance."""
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.tif'):
+            file_path = os.path.join(folder_path, filename)
+            output_path = os.path.join(output_folder, filename)
+
+            metadata = extract_metadata(file_path)
+            raw_image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+            radiance_image = raw_image_to_radiance(metadata, raw_image)
+            cv2.imwrite(output_path, (radiance_image * 65535).astype(np.uint16))
+
+def draw_rectangle(event, x, y, flags, param):
+    """Callback function for drawing a rectangle interactively."""
+    global ix, iy, drawing, rectangle
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        ix, iy = x, y
+
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing:
+            temp_image = param.copy()
+            cv2.rectangle(temp_image, (ix, iy), (x, y), (0, 255, 0), 2)
+            cv2.imshow("Draw a bounding box", temp_image)
+
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        rectangle = (ix, iy, x, y)
+        cv2.rectangle(param, (ix, iy), (x, y), (0, 255, 0), 2)
+        cv2.imshow("Draw a bounding box", param)
+
+def interactive_box_drawing(image_path):
+    """Allows the user to draw a bounding box on an image."""
+    global rectangle
+
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image.dtype == np.uint16:
+        image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    image_copy = image.copy()
+    cv2.imshow("Draw a bounding box", image_copy)
+    cv2.setMouseCallback("Draw a bounding box", draw_rectangle, image_copy)
+
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+    return rectangle
+
+def calculate_mean_radiance(image, bounding_box):
+    """Calculate mean radiance inside the bounding box."""
+    x1, y1, x2, y2 = bounding_box
+    panel_region = image[y1:y2, x1:x2]
+    return np.mean(panel_region)
+
+def apply_reflectance_conversion(land_folder, reflectance_factors, output_folder, bands):
+    """Convert radiance land images to reflectance and save as float TIFF."""
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    for filename in os.listdir(land_folder):
+        if filename.endswith('.tif'):
+            band_index = int(filename.split('_')[-1].split('.')[0]) - 1
+            band = bands[band_index]
+            file_path = os.path.join(land_folder, filename)
+            output_path = os.path.join(output_folder, filename)
+
+            # Read radiance image
+            image = cv2.imread(file_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+
+            # Convert to reflectance
+            reflectance_image = image * reflectance_factors[band]
+
+            # Save the reflectance image as a 32-bit float TIFF
+            cv2.imwrite(output_path, reflectance_image.astype(np.float32))
+
+            print(f"Saved reflectance image for {band}: {output_path}")
+def main():
+    panel_folder = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\panel"
+    land_folder = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\images"
+    radiance_panel_folder = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\RadiancePanel1"
+    radiance_land_folder = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\RadianceLand1"
+    reflectance_output_folder = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\ReflectanceOutput"
+    bands = ["Blue", "Green", "Red", "Red edge", "NIR"]
+
+    # Step 1: Convert panel and land images to radiance
+    process_images_to_radiance(panel_folder, radiance_panel_folder)
+    process_images_to_radiance(land_folder, radiance_land_folder)
+
+    # Step 2: Interactively calculate reflectance factors
+    reflectance_factors = {}
+    for band, filename in zip(bands, sorted(os.listdir(radiance_panel_folder))):
+        image_path = os.path.join(radiance_panel_folder, filename)
+        bounding_box = interactive_box_drawing(image_path)
+        if bounding_box:
+            image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            mean_radiance = calculate_mean_radiance(image, bounding_box)
+            reflectance_factors[band] = panelCalibration[band] / mean_radiance
+
+    # Step 3: Apply reflectance conversion to land images
+    apply_reflectance_conversion(radiance_land_folder, reflectance_factors, reflectance_output_folder, bands)
+
+if __name__ == "__main__":
+    main()
+
+
+# In[ ]:
+
+
+## Histogram Matching
+
+import os
+import cv2
+import numpy as np
+from skimage import exposure
+
+def load_image_as_float(image_path):
+    """Load an image as a float32 numpy array."""
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+    return image
+
+def save_image_as_float(image, output_path):
+    """Save an image as a 32-bit float TIFF."""
+    cv2.imwrite(output_path, image.astype(np.float32))
+
+def histogram_match_images(input_folder, output_folder, bands, reference_images):
+    """
+    Perform histogram matching for each band and save the results.
+    
+    Args:
+        input_folder (str): Folder containing input images.
+        output_folder (str): Folder to save processed images.
+        bands (list): List of band names (e.g., ["Blue", "Green", "Red", "NIR", "Red edge"]).
+        reference_images (dict): Dictionary containing reference images for each band.
+    """
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    for filename in os.listdir(input_folder):
+        if filename.endswith('.tif'):
+            band_index = int(filename.split('_')[-1].split('.')[0]) - 1
+            band = bands[band_index]
+
+            # Load input image
+            image_path = os.path.join(input_folder, filename)
+            image = load_image_as_float(image_path)
+
+            # Load reference image for this band
+            reference_image = reference_images[band]
+
+            # Perform histogram matching
+            matched_image = exposure.match_histograms(image, reference_image)#, multichannel=False)
+
+            # Save the matched image
+            output_path = os.path.join(output_folder, filename)
+            save_image_as_float(matched_image, output_path)
+            print(f"Saved histogram-matched image for {band}: {output_path}")
+
+def prepare_reference_images(input_folder, bands):
+    """
+    Prepare reference images for each band by selecting one image from the folder.
+    """
+    reference_images = {}
+    for band_index, band in enumerate(bands):
+        for filename in os.listdir(input_folder):
+            if filename.endswith(f"_{band_index + 1}.tif"):
+                image_path = os.path.join(input_folder, filename)
+                reference_images[band] = load_image_as_float(image_path)
+                print(f"Selected reference image for {band}: {filename}")
+                break
+    return reference_images
+
+# Example usage
+input_folder = r"C:\Tarun\CIFA_ponds\0000SET\ReflectanceOutput"
+output_folder = r"C:\Tarun\CIFA_ponds\0000SET\histogram1"
+bands = ["Blue", "Green", "Red", "Red edge", "NIR"]
+
+# Step 1: Prepare reference images for each band
+reference_images = prepare_reference_images(input_folder, bands)
+
+# Step 2: Perform histogram matching and save results
+histogram_match_images(input_folder, output_folder, bands, reference_images)
+
+
+# In[1]:
+
+
+## reads metadata
+
+import os
+import csv
+from exiftool import ExifTool
+
+def extract_all_metadata(image_path):
+    """
+    Extract all metadata from an image using ExifTool.
+    Args:
+        image_path (str): Path to the image file.
+    Returns:
+        dict: Dictionary of all metadata key-value pairs.
+    """
+    with ExifTool() as et:
+        metadata = et.get_metadata(image_path)  # Collect all available metadata
+    return metadata
+
+def save_all_metadata_to_csv(image_folder, output_csv_path):
+    """
+    Extract all metadata from images in a folder and save to a CSV file.
+    Args:
+        image_folder (str): Folder containing the images.
+        output_csv_path (str): Path to save the metadata CSV file.
+    """
+    if not os.path.exists(os.path.dirname(output_csv_path)):
+        os.makedirs(os.path.dirname(output_csv_path))
+
+    # Collect metadata from all images
+    metadata_list = []
+    for filename in os.listdir(image_folder):
+        if filename.lower().endswith(('.tif', '.jpg', '.png')):  # Adjust extensions as needed
+            image_path = os.path.join(image_folder, filename)
+            metadata = extract_all_metadata(image_path)
+            metadata['SourceFile'] = filename  # Add filename for reference
+            metadata_list.append(metadata)
+
+    # Determine all unique keys (to handle missing fields in some images)
+    all_keys = set()
+    for metadata in metadata_list:
+        all_keys.update(metadata.keys())
+    
+    # Write metadata to a CSV file
+    with open(output_csv_path, mode='w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=sorted(all_keys))  # Sort keys for consistent columns
+        writer.writeheader()
+        for metadata in metadata_list:
+            writer.writerow(metadata)
+
+    print(f"Metadata saved to {output_csv_path}")
+
+# Example usage
+image_folder = r"C:\Tarun\CIFA_ponds\0000SET\Cifa_40\data\images"  # Folder containing histogram-corrected images
+#output_csv_path = r"C:\Tarun\metadata\all_image_metadata1.csv"
+output_csv_path = r"C:\Tarun\CIFA_ponds\0000SET\Cifa_40\data\metadata\all_image_metadata.csv"
+
+save_all_metadata_to_csv(image_folder, output_csv_path)
+
+
+# In[8]:
+
+
+#Georeferencing working
+
+import os
+import math
+from pathlib import Path
+from osgeo import gdal, osr
+import csv
+
+# Folder paths
+input_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\histogram1"
+output_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\georeferenced1"
+#output folder exists
+# Check if output folder exists and create it if not
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# Pixel size in meters
+pixel_size_meters = 0.023  # Ground sampling distance (GSD)
+
+# Function to convert pixel size to degrees
+def convert_pixel_size_to_degrees(pixel_size_meters, latitude):
+    """
+    Converts pixel size in meters to degrees of latitude and longitude
+    based on the given latitude.
+    """
+    pixel_size_lat = pixel_size_meters / 111320  # Degrees latitude per meter
+    pixel_size_long = pixel_size_meters / (111320 * math.cos(math.radians(latitude)))  # Degrees longitude per meter
+    return pixel_size_lat, pixel_size_long
+
+# Read metadata
+metadata_dict = {}
+#csv_file = r"D:\\Tarun\\iari\\Amrit_Sarovar\\test\\image_metadata.csv"
+csv_file = r"C:\\Tarun\\CIFA_ponds\\0000SET\\Cifa_40\\data\\metadata\\image_metadata.csv"
+# Load metadata into a dictionary
+with open(csv_file, mode="r", newline="", encoding="utf-8") as csvfile:
+    reader = csv.DictReader(csvfile)
+    for row in reader:
+        image_name = row["File:FileName"]  # Image filename
+        lon = float(row["EXIF:GPSLongitude"])  # Latitude in DD
+        lat = float(row["EXIF:GPSLatitude"])  # Longitude in DD
+        metadata_dict[image_name] = {"latitude": lat, "longitude": lon}
+
+# Process each image
+for image_name, metadata in metadata_dict.items():
+    image_path = Path(input_folder) / image_name
+    output_image_path = Path(output_folder) / f"georeferenced_{image_name}"
+
+    # Open image using GDAL
+    ds = gdal.Open(str(image_path))
+    if ds is None:
+        print(f"Error: Unable to open {image_path}")
+        continue
+
+    # Spatial reference system (WGS 84)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+
+    # Convert pixel size from meters to degrees
+    pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, metadata["latitude"])
+
+    center_x = metadata["longitude"] - (pixel_size_long * ds.RasterXSize / 2)
+    center_y = metadata["latitude"] + (pixel_size_lat * ds.RasterYSize / 2)
+
+    new_geotransform = (
+        center_x,        # Top-left corner longitude
+        pixel_size_long,   # Pixel size in longitude direction
+        0,                 # No rotation (row rotation)
+        center_y,        # Top-left corner latitude
+        0,                 # No rotation (column rotation)
+        -pixel_size_lat    # Negative for north-down
+    )
+
+    # Create the output dataset
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        str(output_image_path),
+        ds.RasterXSize,
+        ds.RasterYSize,
+        ds.RasterCount,
+        ds.GetRasterBand(1).DataType,
+    )
+    if out_ds is None:
+        print(f"Error: Unable to create output dataset for {output_image_path}")
+        ds = None
+        continue
+
+    # Apply geo-transform and projection
+    out_ds.SetGeoTransform(new_geotransform)
+    out_ds.SetProjection(srs.ExportToWkt())
+
+    # Copy all raster bands
+    for i in range(1, ds.RasterCount + 1):
+        in_band = ds.GetRasterBand(i)
+        out_band = out_ds.GetRasterBand(i)
+        out_band.WriteArray(in_band.ReadAsArray())
+
+    # Close datasets
+    out_ds = None
+    ds = None
+
+    print(f"Georeferenced image saved to: {output_image_path}")
+
+# Final message
+print("Processing complete!")
+
+
+# In[2]:
+
+
+##### reads the histogram images
+## rotates them
+## and georeferences them
+## mosaics them
+
+import os
+import math
+import glob
+from pathlib import Path
+from osgeo import gdal, osr
+import csv
+import numpy as np
+import cv2  # OpenCV for image processing
+
+# Folder paths
+input_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\histogram1"
+output_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\rotated_histogram3"
+mosaic_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\mosaics3"
+
+# Ensure the output and mosaic folders exist
+os.makedirs(output_folder, exist_ok=True)
+os.makedirs(mosaic_folder, exist_ok=True)
+
+# Pixel size in meters (Ground Sampling Distance)
+pixel_size_meters = 0.023
+
+# Bands mapping based on suffix
+bands_mapping = {
+    "_1": "Blue",
+    "_2": "Green",
+    "_3": "Red",
+    "_4": "RedEdge",
+    "_5": "NIR"
+}
+
+def convert_pixel_size_to_degrees(pixel_size_meters, latitude):
+    """
+    Converts pixel size in meters to degrees of latitude and longitude
+    based on the given latitude.
+    """
+    pixel_size_lat = pixel_size_meters / 111320  # Degrees latitude per meter
+    pixel_size_long = pixel_size_meters / (111320 * math.cos(math.radians(latitude)))  # Degrees longitude per meter
+    return pixel_size_lat, pixel_size_long
+
+def ModifiedWay(image, angle):
+    """
+    Rotates an image without cropping any portion.
+    """
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    angle = -angle
+
+    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    abs_cos = abs(rotation_matrix[0, 0])
+    abs_sin = abs(rotation_matrix[0, 1])
+
+    new_w = int(h * abs_sin + w * abs_cos)
+    new_h = int(h * abs_cos + w * abs_sin)
+
+    rotation_matrix[0, 2] += (new_w / 2) - center[0]
+    rotation_matrix[1, 2] += (new_h / 2) - center[1]
+
+    rotated_image = cv2.warpAffine(image, rotation_matrix, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    return rotated_image
+
+def mosaic_band_ignore_padding(band_suffix, band_name, nodata_value=0):
+    """
+    Mosaics images of a specific band, ignoring padding values.
+    """
+    print(f"Processing band: {band_name} ({band_suffix})")
+    
+    # Find all images for the given band
+    images = glob.glob(os.path.join(output_folder, f"*{band_suffix}.tif"))
+    if not images:
+        print(f"No images found for band {band_name}")
+        return
+    
+    # Output mosaic file path
+    output_file = os.path.join(mosaic_folder, f"Mosaic_{band_name}.tif")
+    
+    # GDAL command for mosaicking with nodata handling
+    gdal.Warp(
+        output_file,
+        images,
+        format="GTiff",
+        options=[
+            "COMPRESS=LZW",  # Compression for output
+            "BIGTIFF=YES",   # Support for large files
+            f"UNIFIED_SRC_NODATA=YES",  # Unified nodata handling
+        ],
+        srcNodata=nodata_value  # Set padding value as nodata
+    )
+    
+    print(f"Mosaic saved for band {band_name}: {output_file}")
+
+# Read metadata from CSV
+metadata_dict = {}
+csv_file = r"C:\\Tarun\\CIFA_ponds\\0000SET\\metadata\\image_metadata3.csv"
+with open(csv_file, mode="r", newline="", encoding="utf-8") as csvfile:
+    reader = csv.DictReader(csvfile)
+    for row in reader:
+        image_name = row["File:FileName"]
+        lon = float(row["EXIF:GPSLongitude"])  # Longitude
+        lat = float(row["EXIF:GPSLatitude"])  # Latitude
+        heading_deg = float(row["Rotation"])  # Heading in degrees
+        metadata_dict[image_name] = {"latitude": lat, "longitude": lon, "heading": heading_deg}
+
+# Process each image
+for image_name, metadata in metadata_dict.items():
+    image_path = Path(input_folder) / image_name
+    output_image_path = Path(output_folder) / f"georeferenced_{image_name}"
+
+    # Open image using GDAL
+    ds = gdal.Open(str(image_path))
+    if ds is None:
+        print(f"Error: Unable to open {image_path}")
+        continue
+
+    # Read the image data (raster)
+    image_data = ds.ReadAsArray()
+
+    # Rotate the image using the ModifiedWay function
+    heading_deg = metadata["heading"]
+    rotated_image = ModifiedWay(image_data, heading_deg)
+
+    # Spatial reference system (WGS 84)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+
+    # Convert pixel size from meters to degrees
+    pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, metadata["latitude"])
+
+    # Calculate georeferencing point based on the center of the rotated image
+    center_x = metadata["longitude"] - (pixel_size_long * rotated_image.shape[1] / 2)
+    center_y = metadata["latitude"] + (pixel_size_lat * rotated_image.shape[0] / 2)
+    
+    new_geotransform = (
+        center_x,           # Top-left longitude (centered)
+        pixel_size_long,    # Pixel size in longitude
+        0,                  # No rotation/skew in X direction
+        center_y,           # Top-left latitude (centered)
+        0,                  # No rotation/skew in Y direction
+        -pixel_size_lat     # Pixel size in latitude (negative for North-to-South)
+    )
+
+
+    # Create the output dataset with the new dimensions
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        str(output_image_path),
+        rotated_image.shape[1],
+        rotated_image.shape[0],
+        ds.RasterCount,
+        ds.GetRasterBand(1).DataType,
+    )
+    if out_ds is None:
+        print(f"Error: Unable to create output dataset for {output_image_path}")
+        ds = None
+        continue
+
+    # Apply geo-transform and projection
+    out_ds.SetGeoTransform(new_geotransform)
+    out_ds.SetProjection(srs.ExportToWkt())
+
+    # Write the rotated image to the output file
+    for i in range(1, ds.RasterCount + 1):
+        out_band = out_ds.GetRasterBand(i)
+        out_band.WriteArray(rotated_image)
+
+    # Close datasets
+    out_ds = None
+    ds = None
+
+    print(f"Georeferenced and rotated image saved to: {output_image_path}")
+
+# Mosaic each band
+for suffix, band in bands_mapping.items():
+    mosaic_band_ignore_padding(suffix, band)
+
+print("Processing and mosaicking complete!")
+
+
+# In[23]:
+
+
+#ORB Model Feature Detection
+#Affine Allignment
+#saving the alligned image
+#saves the warp matrix
+#working
+
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import os
+import json
+
+# ORB keypoint detection and descriptor extraction
+def orb_keypoints_descriptors(img):
+    # Create ORB object and detect keypoints and descriptors
+    orb = cv2.ORB_create(nfeatures=2000)  # You can adjust nfeatures as needed
+    keypoints, descriptors = orb.detectAndCompute(img, None)
+    return keypoints, descriptors
+
+# Function to match descriptors using adjustable max_matches
+def match_features(des1, des2, max_matches=500):
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)  # Use NORM_HAMMING for ORB descriptors
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    # Limit the number of matches to max_matches
+    return matches[:max_matches]
+
+def apply_transformation_with_save(kp1, kp2, matches, transformation_type, img, ref_img, band_name, output_folder):
+    """Apply transformation, calculate inlier percentage, and save the warp matrix."""
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    matrix = None
+    aligned_img = None
+
+    if transformation_type == 'homography':
+        matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'affine':
+        matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    elif transformation_type == 'similarity':
+        matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+        aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+    else:
+        raise ValueError("Unknown transformation type")
+
+    # Calculate inlier percentage
+    inliers = np.sum(mask)
+    total_matches = len(matches)
+    inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+
+    print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+
+    # Save the warp matrix
+    if matrix is not None:
+        matrix_file = os.path.join(output_folder, f"{band_name}_{transformation_type}_warp_matrix.json")
+        with open(matrix_file, "w") as f:
+            json.dump(matrix.tolist(), f)
+        print(f"Warp matrix for {band_name} ({transformation_type}) saved to {matrix_file}")
+
+    return aligned_img, inlier_percentage, matrix
+
+# Function to display keypoints on an image
+def draw_keypoints(img, keypoints, title):
+    img_with_keypoints = cv2.drawKeypoints(img, keypoints, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to display matches between two images
+def draw_matches(img1, kp1, img2, kp2, matches, title):
+    img_matches = cv2.drawMatches(img1, kp1, img2, kp2, matches[:50], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    plt.imshow(img_matches, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# Function to calculate RMSE
+def calculate_rmse(img1, img2):
+    error = mean_squared_error(img1, img2, squared=False)
+    return error
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+
+def process_bands_with_save(band_images, ref_img, image_names, output_folder, max_matches=1500):
+    """Process bands, save aligned images, and store warp matrices."""
+    aligned_images = {'homography': [], 'affine': [], 'similarity': []}
+    inlier_percentages = {'homography': [], 'affine': [], 'similarity': []}
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    for i, img in enumerate(band_images):
+        print(f"\nProcessing {image_names[i]} band...")
+
+        # Detect keypoints and descriptors
+        kp1, des1 = orb_keypoints_descriptors(img)
+        kp2, des2 = orb_keypoints_descriptors(ref_img)
+
+        # Match features
+        matches = match_features(des1, des2, max_matches)
+
+        # Apply transformations and save matrices
+        for transformation_type in ['affine']:
+            aligned_img, inlier_percentage, matrix = apply_transformation_with_save(
+                kp1, kp2, matches, transformation_type, img, ref_img, image_names[i], output_folder
+            )
+            aligned_images[transformation_type].append(aligned_img)
+            inlier_percentages[transformation_type].append(inlier_percentage)
+
+    return aligned_images, inlier_percentages
+
+    # return aligned_images, inlier_percentages
+
+def crop_to_valid_pixels(aligned_images):
+    """
+    Crop all aligned images to the region where all bands have valid (non-zero) pixels.
+    
+    Parameters:
+        aligned_images (list of np.ndarray): List of aligned images (bands).
+    
+    Returns:
+        list of np.ndarray: Cropped images.
+    """
+    # Create a mask for each band where pixel values are valid (non-zero)
+    valid_masks = [img > 0 for img in aligned_images]
+    
+    # Combine all masks to find the common valid region
+    combined_mask = np.logical_and.reduce(valid_masks)
+    
+    # Find the bounding box of the common valid region
+    rows, cols = np.where(combined_mask)
+    if len(rows) == 0 or len(cols) == 0:
+        raise ValueError("No overlapping area found. Ensure images are properly aligned.")
+    
+    row_min, row_max = rows.min(), rows.max()
+    col_min, col_max = cols.min(), cols.max()
+    
+    # Crop each image to the bounding box
+    cropped_images = [img[row_min:row_max+1, col_min:col_max+1] for img in aligned_images]
+    return cropped_images
+
+def load_tif(path):
+    try:
+        with rasterio.open(path) as src:
+            # Assuming you want the first band as grayscale
+            img = src.read(1)  # Read the first band
+            return img
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+    
+blue = load_tif('C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\unrotated\\georeferenced_IMG_0065_1.tif')
+green = load_tif('C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\unrotated\\georeferenced_IMG_0065_2.tif')
+red = load_tif('C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\unrotated\\georeferenced_IMG_0065_3.tif')
+nir = load_tif('C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\unrotated\\georeferenced_IMG_0065_4.tif')
+ref_img = load_tif('C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\unrotated\\georeferenced_IMG_0065_5.tif')
+
+blue = (blue * 255).astype(np.uint8)
+green = (green * 255).astype(np.uint8)
+red = (red * 255).astype(np.uint8)
+nir = (nir * 255).astype(np.uint8)
+ref_img = (ref_img * 255).astype(np.uint8)
+
+band_images = [blue, green, red, nir]
+image_names = ['Blue', 'Green', 'Red', 'NIR']
+
+
+output_folder_matrices = "C:/Tarun/CIFA_ponds/0000SET/aligned/warp_matrices"
+
+# Call the function with adjustable max_matches
+aligned_images, inlier_percentages = process_bands_with_save(
+    band_images, ref_img, image_names, output_folder_matrices, max_matches=1500
+)
+
+# aligned_images, inlier_percentages = process_bands(band_images, ref_img, image_names, max_matches=1500)
+
+# List of aligned bands including the reference image
+aligned_bands = aligned_images['affine']  # Choose the transformation type (affine in this case)
+aligned_bands_with_reference = aligned_bands + [ref_img]  # Add reference image to the list
+
+# Crop the images to the common valid region
+aligned_bands_cropped = crop_to_valid_pixels(aligned_bands_with_reference)
+
+# Save the cropped images as a stacked TIFF
+save_as_rasterio_tiff(
+    aligned_bands_cropped[0],  # Blue
+    aligned_bands_cropped[1],  # Green
+    aligned_bands_cropped[2],  # Red
+    aligned_bands_cropped[4],  # Reference (RedEdge)
+    aligned_bands_cropped[3],  # NIR
+    #'C:\\Users\\BDL\\Desktop\\pots\\Results\\ORB_affine_cropped_valid.tif'
+    'C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\aligned\\test.tif'
+)
+
+#Warp multiple files using a stored warp matrix
+# working
+
+import os
+import json
+import cv2
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+
+# Function to load TIFF images
+def load_tif(path):
+    try:
+        with rasterio.open(path) as src:
+            img = src.read(1)  # Read the first band
+            return img
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+# Function to save aligned images as stacked TIFF
+def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
+    height, width = blue.shape
+    transform = from_origin(0, 0, 1, 1)
+
+    with rasterio.open(
+        output_path, 'w',
+        driver='GTiff',
+        height=height,
+        width=width,
+        count=5,
+        dtype=blue.dtype,
+        crs='+proj=latlong',
+        transform=transform
+    ) as dst:
+        dst.write(blue, 1)
+        dst.write(green, 2)
+        dst.write(red, 3)
+        dst.write(red_edge, 4)
+        dst.write(nir, 5)
+
+# Function to find capture sets based on filenames
+def find_capture_sets(folder):
+    files = [f for f in os.listdir(folder) if f.endswith(".tif")]
+    capture_sets = {}
+    for file in files:
+        base_name, band = file.rsplit("_", 1)
+        band = int(band.split(".")[0])  # Extract numeric band
+        if base_name not in capture_sets:
+            capture_sets[base_name] = {}
+        capture_sets[base_name][band] = os.path.join(folder, file)
+    return capture_sets
+
+# Function to crop aligned images to valid pixels
+def crop_to_valid_pixels(aligned_images):
+    valid_masks = [img > 0 for img in aligned_images]
+    combined_mask = np.logical_and.reduce(valid_masks)
+    rows, cols = np.where(combined_mask)
+    if len(rows) == 0 or len(cols) == 0:
+        raise ValueError("No overlapping area found. Ensure images are properly aligned.")
+    row_min, row_max = rows.min(), rows.max()
+    col_min, col_max = cols.min(), cols.max()
+    cropped_images = [img[row_min:row_max+1, col_min:col_max+1] for img in aligned_images]
+    return cropped_images
+
+def load_warp_matrices(folder, transformation_type, band_names, ref_band_name):
+    """Load warp matrices for bands except the reference band."""
+    warp_matrices = {}
+    for band_name in band_names:
+        if band_name == ref_band_name:
+            continue  # Skip the reference band
+        matrix_file = os.path.join(folder, f"{band_name}_{transformation_type}_warp_matrix.json")
+        if not os.path.exists(matrix_file):
+            raise FileNotFoundError(f"Warp matrix file not found: {matrix_file}")
+        with open(matrix_file, "r") as f:
+            warp_matrices[band_name] = np.array(json.load(f))
+    return warp_matrices
+
+
+# Function to align bands using precomputed warp matrices
+def align_bands_with_matrices(band_images, warp_matrices, ref_img_shape, band_names):
+    aligned_bands = []
+    for i, img in enumerate(band_images):
+        band_name = band_names[i]
+        warp_matrix = warp_matrices.get(band_name)
+        if warp_matrix is None:
+            raise ValueError(f"No warp matrix found for band: {band_name}")
+        aligned_band = cv2.warpAffine(img, warp_matrix[:2], (ref_img_shape[1], ref_img_shape[0]), flags=cv2.INTER_LINEAR)
+        aligned_bands.append(aligned_band)
+    return aligned_bands
+
+def process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band_index=4, transformation_type='affine'):
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Define band names and order
+    band_names = ['Blue', 'Green', 'Red', 'RedEdge', 'NIR']
+    band_order = [1, 2, 3, 5, 4]  # Corresponding file suffixes
+
+    # Identify the reference band name
+    ref_band_name = band_names[ref_band_index - 1]
+
+    # Load warp matrices, excluding the reference band
+    warp_matrices = load_warp_matrices(warp_matrix_folder, transformation_type, band_names, ref_band_name)
+
+    # Find all image sets in the folder
+    capture_sets = find_capture_sets(input_folder)
+    if not capture_sets:
+        raise ValueError("No capture sets found in the input folder.")
+
+    # Process each image set
+    for set_name, set_files in capture_sets.items():
+        print(f"Processing set: {set_name}")
+
+        if not all(band in set_files for band in band_order):
+            print(f"Skipping set {set_name} due to missing bands.")
+            continue
+
+        # Load all bands
+        band_images = [load_tif(set_files[band]) for band in band_order]
+        ref_img = band_images[ref_band_index - 1]  # Use the specified band as reference
+
+        # Align bands using precomputed matrices
+        aligned_bands = []
+        for i, img in enumerate(band_images):
+            band_name = band_names[i]
+            if band_name == ref_band_name:
+                aligned_bands.append(ref_img)  # Skip alignment for the reference band
+            else:
+                warp_matrix = warp_matrices[band_name]
+                aligned_band = cv2.warpAffine(img, warp_matrix[:2], (ref_img.shape[1], ref_img.shape[0]), flags=cv2.INTER_LINEAR)
+                aligned_bands.append(aligned_band)
+
+        # Crop to valid region
+        aligned_bands_cropped = crop_to_valid_pixels(aligned_bands)
+
+        # Save as layerstacked GeoTIFF
+        output_path = os.path.join(output_folder, f"{set_name}_stacked.tif")
+        save_as_rasterio_tiff(
+            aligned_bands_cropped[0],  # Blue
+            aligned_bands_cropped[1],  # Green
+            aligned_bands_cropped[2],  # Red
+            aligned_bands_cropped[3],  # RedEdge
+            aligned_bands_cropped[4],  # NIR
+            output_path
+        )
+        print(f"Saved layerstacked image to: {output_path}")
+
+
+# Input and Output Folders
+#input_folder = "C:/Tarun/CIFA_ponds/0000SET/allignment_test/unrotated"
+input_folder = "C:\\Tarun\\CIFA_ponds\\0000SET\\georeferenced1"
+warp_matrix_folder = "C:/Tarun/CIFA_ponds/0000SET/aligned/warp_matrices"
+output_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/aligned_output"
+
+# Run the processing
+process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band_index=4, transformation_type='affine')
+
+
+# In[ ]:
+
+
+#Georeferncing and rotation of layerstacked images from a folder and metadata csv.
+
+import os
+import csv
+import math
+from osgeo import gdal, osr
+import cv2
+import numpy as np
+
+
+# Function to convert pixel size to degrees
+def convert_pixel_size_to_degrees(pixel_size_meters, latitude):
+    """Converts pixel size in meters to degrees based on latitude."""
+    pixel_size_lat = pixel_size_meters / 111320  # Degrees latitude per meter
+    pixel_size_long = pixel_size_meters / (111320 * math.cos(math.radians(latitude)))  # Degrees longitude per meter
+    return pixel_size_lat, pixel_size_long
+
+
+# Function to rotate an image without cropping
+def rotate_image_without_clipping(image, angle):
+    """Rotates an image without cropping or clipping."""
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    rotation_matrix = cv2.getRotationMatrix2D(center, -angle, 1.0)
+
+    # Calculate new bounding dimensions
+    abs_cos = abs(rotation_matrix[0, 0])
+    abs_sin = abs(rotation_matrix[0, 1])
+    new_w = int(h * abs_sin + w * abs_cos)
+    new_h = int(h * abs_cos + w * abs_sin)
+
+    # Adjust the rotation matrix to account for the new bounding dimensions
+    rotation_matrix[0, 2] += (new_w / 2) - center[0]
+    rotation_matrix[1, 2] += (new_h / 2) - center[1]
+
+    # Perform the actual rotation
+    rotated_image = cv2.warpAffine(image, rotation_matrix, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    return rotated_image
+
+
+# Function to process the layerstacked image
+def process_layerstacked_image(input_path, output_path, metadata, pixel_size_meters):
+    """Processes a layerstacked image by applying georeferencing and rotation."""
+    # Open the layerstacked image
+    ds = gdal.Open(input_path)
+    if ds is None:
+        print(f"Error: Unable to open {input_path}")
+        return
+
+    # Read the image data (all bands)
+    bands = [ds.GetRasterBand(i + 1).ReadAsArray() for i in range(ds.RasterCount)]
+    stacked_image = np.stack(bands, axis=-1)
+
+    # Rotate the image
+    rotated_image = rotate_image_without_clipping(stacked_image, metadata["rotation"])
+
+    # Convert pixel size from meters to degrees
+    pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, metadata["latitude"])
+
+    # Calculate georeferencing based on the rotated image size
+    center_x = metadata["longitude"] - (pixel_size_long * rotated_image.shape[1] / 2)
+    center_y = metadata["latitude"] + (pixel_size_lat * rotated_image.shape[0] / 2)
+
+    new_geotransform = (
+        center_x,           # Top-left longitude
+        pixel_size_long,    # Pixel size in longitude
+        0,                  # No rotation/skew in X direction
+        center_y,           # Top-left latitude
+        0,                  # No rotation/skew in Y direction
+        -pixel_size_lat     # Pixel size in latitude (negative for North-to-South)
+    )
+
+    # Spatial reference system (WGS 84)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+
+    # Create the output dataset
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        output_path,
+        rotated_image.shape[1],
+        rotated_image.shape[0],
+        ds.RasterCount,
+        gdal.GDT_Float32,
+    )
+    if out_ds is None:
+        print(f"Error: Unable to create output dataset for {output_path}")
+        return
+
+    # Apply geotransform and projection
+    out_ds.SetGeoTransform(new_geotransform)
+    out_ds.SetProjection(srs.ExportToWkt())
+
+    # Write each band to the output
+    for i in range(rotated_image.shape[-1]):
+        out_ds.GetRasterBand(i + 1).WriteArray(rotated_image[:, :, i])
+
+    # Close datasets
+    out_ds = None
+    ds = None
+    print(f"Processed and saved: {output_path}")
+
+
+# Main function to process all layerstacked images
+def process_images(input_folder, csv_file, output_folder, pixel_size_meters):
+    """Processes all layerstacked images with metadata from CSV."""
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Read metadata from CSV
+    metadata_dict = {}
+    with open(csv_file, mode="r", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            base_name = row["File:FileName"].split("_")[0]  # Extract IMG_XXXX
+            if base_name not in metadata_dict:
+                metadata_dict[base_name] = {
+                    "latitude": float(row["EXIF:GPSLatitude"]),
+                    "longitude": float(row["EXIF:GPSLongitude"]),
+                    "rotation": float(row["Rotation"]),
+                }
+
+    # Process each layerstacked image
+    for filename in os.listdir(input_folder):
+        if filename.startswith("georeferenced") and filename.endswith("_stacked.tif"):
+            base_name = filename.split("_")[1]
+            if base_name in metadata_dict:
+                input_path = os.path.join(input_folder, filename)
+                output_path = os.path.join(output_folder, filename)
+                process_layerstacked_image(input_path, output_path, metadata_dict[base_name], pixel_size_meters)
+            else:
+                print(f"Metadata not found for {filename}. Skipping.")
+
+
+# Paths and parameters
+input_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/aligned_output"
+csv_file = "C:/Tarun/CIFA_ponds/0000SET/metadata/image_metadata.csv"
+output_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/georeferenced_rotated_output"
+pixel_size_meters = 0.023
+
+# Run the processing
+process_images(input_folder, csv_file, output_folder, pixel_size_meters)
+
+
+# In[16]:
+
+
+# georeferencing and rotating the larestacked iamges.
+#working.
+
+import os
+import csv
+import math
+from osgeo import gdal, osr
+import cv2
+import numpy as np
+
+# Function to convert pixel size to degrees
+def convert_pixel_size_to_degrees(pixel_size_meters, latitude):
+    pixel_size_lat = pixel_size_meters / 111320  # Degrees latitude per meter
+    pixel_size_long = pixel_size_meters / (111320 * math.cos(math.radians(latitude)))  # Degrees longitude per meter
+    return pixel_size_lat, pixel_size_long
+
+# Function to rotate multi-band image without clipping
+def rotate_multiband_image_without_clipping(image, angle):
+    bands, height, width = image.shape
+    rotated_bands = []
+    for i in range(bands):
+        band = image[i, :, :]  # Extract single band
+        (h, w) = band.shape
+        center = (w // 2, h // 2)
+        rotation_matrix = cv2.getRotationMatrix2D(center, -angle, 1.0)
+
+        # Calculate new bounding dimensions
+        abs_cos = abs(rotation_matrix[0, 0])
+        abs_sin = abs(rotation_matrix[0, 1])
+        new_w = int(h * abs_sin + w * abs_cos)
+        new_h = int(h * abs_cos + w * abs_sin)
+
+        # Adjust the rotation matrix for the new bounding dimensions
+        rotation_matrix[0, 2] += (new_w / 2) - center[0]
+        rotation_matrix[1, 2] += (new_h / 2) - center[1]
+
+        # Rotate the single band
+        rotated_band = cv2.warpAffine(band, rotation_matrix, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        rotated_bands.append(rotated_band)
+
+    # Stack rotated bands back into a multi-band image
+    return np.stack(rotated_bands, axis=0)
+
+# Main processing function
+def process_layerstacked_images(input_folder, csv_file, output_folder, pixel_size_meters):
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Load metadata from CSV
+    metadata_dict = {}
+    with open(csv_file, mode="r", newline="", encoding="utf-8") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            metadata_dict[row["name"]] = {
+                "latitude": float(row["EXIF:GPSLatitude"]),
+                "longitude": float(row["EXIF:GPSLongitude"]),
+                "heading": float(row["Rotation"]),
+            }
+
+    # Process each image in the input folder
+    for filename in os.listdir(input_folder):
+        if not filename.endswith("_stacked.tif"):
+            continue
+
+        image_path = os.path.join(input_folder, filename)
+        output_image_path = os.path.join(output_folder, filename)
+
+        # Get metadata for the current image
+        if filename not in metadata_dict:
+            print(f"No metadata found for {filename}. Skipping.")
+            continue
+
+        metadata = metadata_dict[filename]
+        latitude = metadata["latitude"]
+        longitude = metadata["longitude"]
+        heading_deg = metadata["heading"]
+
+        # Open the image using GDAL
+        ds = gdal.Open(image_path)
+        if ds is None:
+            print(f"Error: Unable to open {image_path}")
+            continue
+
+        # Read the image data
+        image_data = ds.ReadAsArray()
+        if image_data is None or image_data.ndim != 3:
+            print(f"Error: Invalid image data for {image_path}. Expected a 3D array.")
+            continue
+
+        print(f"Processing {image_path} with metadata: Lat {latitude}, Lon {longitude}, Heading {heading_deg}°")
+
+        # Rotate the image
+        try:
+            rotated_image = rotate_multiband_image_without_clipping(image_data, heading_deg)
+        except Exception as e:
+            print(f"Error rotating {image_path}: {e}")
+            continue
+
+        # Spatial reference system (WGS 84)
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+
+        # Convert pixel size from meters to degrees
+        pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, latitude)
+
+        # Calculate georeferencing for the rotated image
+        center_x = longitude - (pixel_size_long * rotated_image.shape[2] / 2)
+        center_y = latitude + (pixel_size_lat * rotated_image.shape[1] / 2)
+
+        new_geotransform = (
+            center_x,           # Top-left longitude
+            pixel_size_long,    # Pixel size in longitude
+            0,                  # No rotation/skew in X direction
+            center_y,           # Top-left latitude
+            0,                  # No rotation/skew in Y direction
+            -pixel_size_lat     # Pixel size in latitude (negative for North-to-South)
+        )
+
+        # Create the output dataset
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(
+            output_image_path,
+            rotated_image.shape[2],  # Width
+            rotated_image.shape[1],  # Height
+            rotated_image.shape[0],  # Number of bands
+            gdal.GDT_Float32,        # Data type (matches MicaSense float32)
+        )
+        if out_ds is None:
+            print(f"Error: Unable to create output dataset for {output_image_path}")
+            continue
+
+        # Apply geo-transform and projection
+        out_ds.SetGeoTransform(new_geotransform)
+        out_ds.SetProjection(srs.ExportToWkt())
+
+        # Write the rotated bands
+        for i in range(rotated_image.shape[0]):
+            out_band = out_ds.GetRasterBand(i + 1)
+            out_band.WriteArray(rotated_image[i, :, :])
+
+        # Close datasets
+        out_ds = None
+        ds = None
+
+        print(f"Processed and saved: {output_image_path}")
+
+# Input and output paths
+input_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/aligned_output"
+csv_file = "C:/Tarun/CIFA_ponds/0000SET/metadata/image_metadata4.csv"
+output_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/georeferenced_rotated_output"
+pixel_size_meters = 0.023
+
+# Run the processing
+process_layerstacked_images(input_folder, csv_file, output_folder, pixel_size_meters)
+
