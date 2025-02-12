@@ -1,0 +1,600 @@
+# Indices
+
+import numpy as np
+
+# Vegetation
+
+def calculate_ndvi(nir, red):
+    return (nir - red) / (nir + red)
+
+def calculate_ndwi(blue, green, red, nir, swir1, swir2):
+    return (blue + green + red - nir - swir1 - swir2) / (blue + green + red + nir + swir1 + swir2)
+
+def calculate_ari(green, red_edge1):
+    return (1 / green) - (1 / red_edge1)
+
+def calculate_ari2(green, red_edge1, nir):
+    return nir * ((1 / green) - (1 / red_edge1))
+
+def calculate_afri1600(nir, swir1):
+    return (nir - 0.66 * swir1) / (nir + 0.66 * swir1)
+
+def calculate_afri2100(nir, swir2):
+    return (nir - 0.5 * swir2) / (nir + 0.5 * swir2)
+
+def calculate_arvi(nir, red, blue, gamma):
+    return (nir - (red - gamma * (red - blue))) / (nir + (red - gamma * (red - blue)))
+
+def calculate_atsavi(nir, red, sla, slb):
+    return sla * (nir - sla * red - slb) / (sla * nir + red - sla * slb + 0.08 * (1 + sla ** 2.0))
+
+def calculate_avi(nir, red):
+    return (nir * (1.0 - red) * (nir - red)) ** (1/3)
+
+def calculate_aweinsh(green, nir, swir1, swir2):
+    return 4.0 * (green - swir1) - 0.25 * nir + 2.75 * swir2
+
+def calculate_evi(nir, red, blue, g=2.5, c1=6.0, c2=7.5, l=1.0):
+    return g * (nir - red) / (nir + c1 * red - c2 * blue + l)
+
+def calculate_evi2(nir, red, l=1.0, g=2.5):
+    return g * (nir - red) / (nir + 2.4 * red + l)
+
+def calculate_exg(green, red, blue):
+    return 2 * green - red - blue
+
+def calculate_exgr(green, red, blue):
+    return (2.0 * green - red - blue) - (1.3 * red - green)
+
+def calculate_exr(red, green):
+    return 1.3 * red - green
+
+def calculate_fcvi(nir, red, green, blue):
+    return nir - ((red + green + blue) / 3.0)
+
+def calculate_gari(nir, green, blue, red):
+    return (nir - (green - (blue - red))) / (nir - (green + (blue - red)))
+
+def calculate_gbndvi(nir, green, blue):
+    return (nir - (green + blue)) / (nir + (green + blue))
+
+def calculate_gcc(green, red, blue):
+    return green / (red + green + blue)
+
+def calculate_gdvi(nir, red, nexp):
+    return ((nir ** nexp) - (red ** nexp)) / ((nir ** nexp) + (red ** nexp))
+
+def calculate_gemi(nir, red):
+    part1 = ((2.0 * ((nir ** 2.0) - (red ** 2.0)) + 1.5 * nir + 0.5 * red) / (nir + red + 0.5))
+    return part1 * (1.0 - 0.25 * part1) - ((red - 0.125) / (1 - red))
+
+def calculate_gli(green, red, blue):
+    return (2.0 * green - red - blue) / (2.0 * green + red + blue)
+
+def calculate_gm1(red_edge2, green):
+    return red_edge2 / green
+
+def calculate_gm2(red_edge2, red_edge1):
+    return red_edge2 / red_edge1
+
+def calculate_gndvi(nir, green):
+    return (nir - green) / (nir + green)
+
+def calculate_gosavi(nir, green):
+    return (nir - green) / (nir + green + 0.16)
+
+def calculate_grndvi(nir, green, red):
+    return (nir - (green + red)) / (nir + (green + red))
+
+def calculate_grvi(nir, red):
+    return (nir * (1.0 - red) * (nir - red)) ** (1/3)
+
+def calculate_gsavi(nir, red):
+    return (nir * (1.0 - red) * (nir - red)) ** (1/3)
+
+def calculate_gvmi(nir, swir2):
+    return ((nir + 0.1) - (swir2 + 0.02)) / ((nir + 0.1) + (swir2 + 0.02))
+
+def calculate_iavi(nir, red, blue, gamma):
+    return (nir - (red - gamma * (blue - red))) / (nir + (red - gamma * (blue - red)))
+
+def calculate_ikaw(red, blue):
+    return (red - blue) / (red + blue)
+
+def calculate_ipvi(nir, red):
+    return nir / (nir + red)
+
+def calculate_ireci(red, red_edge1, red_edge2, red_edge3):
+    return (red_edge3 - red) / (red_edge1 / red_edge2)
+
+def calculate_mcari(red, green, red_edge1):
+    return ((red_edge1 - red) - 0.2 * (red_edge1 - green)) * (red_edge1 / red)
+
+def calculate_mcari1(nir, red, green):
+    return 1.2 * (2.5 * (nir - red) - 1.3 * (nir - green))
+
+def calculate_mcari2(nir, red, green):
+    return (1.5 * (2.5 * (nir - red) - 1.3 * (nir - green))) / ((((2.0 * nir + 1) ** 2) - (6.0 * nir - 5 * (red ** 0.5)) - 0.5) ** 0.5)
+
+def calculate_mcari705(green, red_edge1, red_edge2):
+    return ((red_edge2 - red_edge1) - 0.2 * (red_edge2 - green)) * (red_edge2 / red_edge1)
+
+def calculate_mcariosavi(red, green, nir, red_edge1):
+    return (((red_edge1 - red) - 0.2 * (red_edge1 - green)) * (red_edge1 / red)) / (1.16 * (nir - red) / (nir + red + 0.16))
+
+def calculate_mcariosavi705(green, red_edge1, red_edge2):
+    return (((red_edge2 - red_edge1) - 0.2 * (red_edge2 - green)) * (red_edge2 / red_edge1)) / (1.16 * (red_edge2 - red_edge1) / (red_edge2 + red_edge1 + 0.16))
+
+def calculate_mgrvi(green, red):
+    return (green ** 2.0 - red ** 2.0) / (green ** 2.0 + red ** 2.0)
+
+def calculate_mndvi(nir, swir2):
+    return (nir - swir2) / (nir + swir2)
+
+def calculate_mnli(nir, red, l):
+    return (1 + l) * ((nir ** 2) - red) / ((nir ** 2) + red + l)
+
+def calculate_mrbvi(red, blue):
+    return (red ** 2.0 - blue ** 2.0) / (red ** 2.0 + blue ** 2.0)
+
+def calculate_msavi(nir, red):
+    return 0.5 * (2.0 * nir + 1 - (((2 * nir + 1) ** 2) - 8 * (nir - red)) ** 0.5)
+
+def calculate_msi(nir, swir1):
+    return swir1 / nir
+    return (red_edge2 - red_edge1) / (red_edge2 + red_edge1)
+
+def calculate_nddi(nir, red, green):
+    ndvi = (nir - red) / (nir + red)
+    gndvi = (green - nir) / (green + nir)
+    return (ndvi - gndvi) / (ndvi + gndvi)
+
+def calculate_ndgi(green, red, nir, lambda_g, lambda_n, lambda_r):
+    numerator = ((lambda_n - lambda_r) / (lambda_n - lambda_g)) * green + (1.0 - ((lambda_n - lambda_r) / (lambda_n - lambda_g))) * nir - red
+    denominator = numerator + 2 * red
+    return numerator / denominator
+
+def calculate_ndii(nir, swir1):
+    return (nir - swir1) / (nir + swir1)
+
+def calculate_ndpi(nir, red, swir1, alpha):
+    return (nir - (alpha * red + (1.0 - alpha) * swir1)) / (nir + (alpha * red + (1.0 - alpha) * swir1))
+
+def calculate_ndrei(nir, red_edge1):
+    return (nir - red_edge1) / (nir + red_edge1)
+
+def calculate_ndvi(nir, red):
+    return (nir - red) / (nir + red)
+
+def calculate_ndyi(green, blue):
+    return (green - blue) / (green + blue)
+
+def calculate_ngrdi(green, red):
+    return (green - red) / (green + red)
+
+def calculate_nirv(nir, red):
+    ndvi = (nir - red) / (nir + red)
+    return ndvi * nir
+
+def calculate_nirvh2(nir, red, lambda_n, lambda_r, k):
+    return nir - red - k * (lambda_n - lambda_r)
+
+def calculate_nirvp(nir, red, par):
+    ndvi = (nir - red) / (nir + red)
+    return ndvi * nir * par
+
+def calculate_nli(nir, red):
+    return ((nir ** 2) - red) / ((nir ** 2) + red)
+
+def calculate_nmdi(nir, swir1, swir2):
+    return (nir - (swir1 - swir2)) / (nir + (swir1 - swir2))
+
+def calculate_nrfig(green, swir2):
+    return (green - swir2) / (green + swir2)
+
+def calculate_nrfir(red, swir2):
+    return (red - swir2) / (red + swir2)
+
+def calculate_normg(green, nir, red):
+    return green / (nir + green + red)
+
+def calculate_normnir(nir, green, red):
+    return nir / (nir + green + red)
+
+def calculate_normr(red, nir, green):
+    return red / (nir + green + red)
+
+def calculate_ocvi(nir, green, red, cexp):
+    return (nir / green) * (red / green) ** cexp
+
+def calculate_osavi(nir, red):
+    return (nir - red) / (nir + red + 0.16)
+
+def calculate_psri(red, blue, red_edge2):
+    return (red - blue) / red_edge2
+
+def calculate_rcc(red, green, blue):
+    return red / (red + green + blue)
+
+def calculate_rdvi(nir, red):
+    return (nir - red) / np.sqrt(nir + red)
+
+def calculate_redsi(red, red_edge1, red_edge3):
+    return ((705.0 - 665.0) * (red_edge3 - red) - (783.0 - 665.0) * (red_edge1 - red)) / (2.0 * red)
+
+def calculate_rgbvi(green, blue, red):
+    return (green ** 2.0 - blue * red) / (green ** 2.0 + blue * red)
+
+def calculate_rgri(red, green):
+    return red / green
+
+def calculate_ri(red, green):
+    return (red - green) / (red + green)
+
+def calculate_rvi(red, red_edge2):
+    return red_edge2 / red
+
+def calculate_s2rep(red, red_edge1, red_edge2, red_edge3):
+    return 705.0 + 35.0 * ((((red_edge3 + red) / 2.0) - red_edge1) / (red_edge2 - red_edge1))
+
+def calculate_sarvi(nir, red, blue, l):
+    return (1 + l) * (nir - (red - (red - blue))) / (nir + (red - (red - blue)) + l)
+
+def calculate_savi(nir, red, l):
+    return (1.0 + l) * (nir - red) / (nir + red + l)
+
+def calculate_savi2(nir, red, sla, slb):
+    return nir / (red + (slb / sla))
+
+def calculate_sevi(nir, red, fdelta):
+    return (nir / red) + fdelta * (1.0 / red)
+
+def calculate_si(blue, green, red):
+    return ((1.0 - blue) * (1.0 - green) * (1.0 - red)) ** (1/3)
+
+def calculate_sipi(nir, a, red):
+    return (nir - a) / (nir - red)
+
+def calculate_sr(nir, red):
+    return nir / red
+
+def calculate_sr2(nir, green):
+    return nir / green
+
+def calculate_sr3(n2, green, red_edge1):
+    return n2 / (green * red_edge1)
+
+def calculate_sr555(red_edge2, green):
+    return red_edge2 / green
+
+def calculate_sr705(red_edge2, green):
+    return red_edge2 / green
+
+def calculate_seli(n2, red_edge1):
+    return (n2 - red_edge1) / (n2 + red_edge1)
+
+def calculate_ocvi(nir, green, red, cexp):
+    return (nir / green) * (red / green) ** cexp
+
+def calculate_osavi(nir, red):
+    return (nir - red) / (nir + red + 0.16)
+
+def calculate_psri(red, blue, red_edge2):
+    return (red - blue) / red_edge2
+
+def calculate_rcc(red, green, blue):
+    return red / (red + green + blue)
+
+def calculate_rdvi(nir, red):
+    return (nir - red) / np.sqrt(nir + red)
+
+def calculate_redsi(red, red_edge1, red_edge3):
+    return ((705.0 - 665.0) * (red_edge3 - red) - (783.0 - 665.0) * (red_edge1 - red)) / (2.0 * red)
+
+def calculate_rgbvi(green, blue, red):
+    return (green ** 2.0 - blue * red) / (green ** 2.0 + blue * red)
+
+def calculate_rgri(red, green):
+    return red / green
+
+def calculate_ri(red, green):
+    return (red - green) / (red + green)
+
+def calculate_rvi(red, red_edge2):
+    return red_edge2 / red
+
+def calculate_s2rep(red, red_edge1, red_edge2, red_edge3):
+    return 705.0 + 35.0 * ((((red_edge3 + red) / 2.0) - red_edge1) / (red_edge2 - red_edge1))
+
+def calculate_sarvi(nir, red, blue, l):
+    return (1 + l) * (nir - (red - (red - blue))) / (nir + (red - (red - blue)) + l)
+
+def calculate_savi(nir, red, l):
+    return (1.0 + l) * (nir - red) / (nir + red + l)
+
+def calculate_savi2(nir, red, sla, slb):
+    return nir / (red + (slb / sla))
+
+def calculate_sevi(nir, red, fdelta):
+    return (nir / red) + fdelta * (1.0 / red)
+
+def calculate_si(blue, green, red):
+    return ((1.0 - blue) * (1.0 - green) * (1.0 - red)) ** (1/3)
+
+def calculate_sipi(nir, a, red):
+    return (nir - a) / (nir - red)
+
+def calculate_sr(nir, red):
+    return nir / red
+
+def calculate_sr2(nir, green):
+    return nir / green
+
+def calculate_sr3(n2, green, red_edge1):
+    return n2 / (green * red_edge1)
+
+def calculate_sr555(red_edge2, green):
+    return red_edge2 / green
+
+def calculate_sr705(red_edge2, green):
+    return red_edge2 / green
+
+def calculate_seli(n2, red_edge1):
+    return (n2 - red_edge1) / (n2 + red_edge1)
+
+def calculate_tcari(red, green, red_edge1):
+    return 3 * ((red_edge1 - red) - 0.2 * (red_edge1 - green) * (red_edge1 / red))
+
+def calculate_tcariosavi(red, green, red_edge1, nir):
+    tcari = 3 * ((red_edge1 - red) - 0.2 * (red_edge1 - green) * (red_edge1 / red))
+    osavi = (nir - red) / (nir + red + 0.16)
+    return tcari / (1.16 * osavi)
+
+def calculate_tcariosavi705(green, red_edge1, red_edge2):
+    tcari = 3 * ((red_edge2 - red_edge1) - 0.2 * (red_edge2 - green) * (red_edge2 / red_edge1))
+    osavi = (red_edge2 - red_edge1) / (red_edge2 + red_edge1 + 0.16)
+    return tcari / (1.16 * osavi)
+
+def calculate_tci(green, red, red_edge1):
+    return 1.2 * (red_edge1 - green) - 1.5 * (red - green) * (red_edge1 / red) ** 0.5
+
+def calculate_tdvi(nir, red):
+    return 1.5 * ((nir - red) / np.sqrt(nir ** 2.0 + red + 0.5))
+
+def calculate_tgi(blue, green, red):
+    return -0.5 * (190 * (red - green) - 120 * (red - blue))
+
+def calculate_trrvi(red, red_edge2, nir):
+    rendvi = (red_edge2 - red) / (red_edge2 + red)
+    ndvi = (nir - red) / (nir + red)
+    return rendvi / (ndvi + 1.0)
+
+def calculate_tsavi(nir, red, sla, slb):
+    return sla * (nir - sla * red - slb) / (sla * nir + red - sla * slb)
+
+def calculate_ttvi(red_edge2, red_edge3, n2):
+    return 0.5 * ((865.0 - 740.0) * (red_edge3 - red_edge2) - (n2 - red_edge2) * (783.0 - 740.0))
+
+def calculate_tvi(nir, red):
+    return np.sqrt(((nir - red) / (nir + red)) + 0.5)
+
+def calculate_trivi(nir, green, red):
+    return 0.5 * (120 * (nir - green) - 200 * (red - green))
+
+def calculate_vari(green, red, blue):
+    return (green - red) / (green + red - blue)
+
+def calculate_vari700(red, blue, red_edge1):
+    return (red_edge1 - 1.7 * red + 0.7 * blue) / (red_edge1 + 1.3 * red - 1.3 * blue)
+
+def calculate_vi700(red, red_edge1):
+    return (red_edge1 - red) / (red_edge1 + red)
+
+def calculate_vig(green, red):
+    return (green - red) / (green + red)
+
+def calculate_wdrvi(nir, red, alpha):
+    return (alpha * nir - red) / (alpha * nir + red)
+
+def calculate_wdvi(nir, red, sla):
+    return nir - sla * red
+
+def calculate_mnd705(red_edge1, red_edge2, a):
+    return (red_edge2 - red_edge1) / (red_edge2 + red_edge1 - a)
+
+def calculate_msr705(red_edge2, a):
+    return (red_edge2 - a) / (red_edge2 + a)
+
+# Burn
+
+def calculate_bai(red, nir):
+    return 1.0 / ((0.1 - red) ** 2.0 + (0.06 - nir) ** 2.0)
+
+def calculate_baim(nir, swir2):
+    return 1.0 / ((0.05 - nir) ** 2.0 + (0.2 - swir2) ** 2.0)
+
+def calculate_bais2(red, red_edge2, red_edge3, nir_narrow, swir2):
+    return (1.0 - ((red_edge2 * red_edge3 * nir_narrow) / red) ** 0.5) * (((swir2 - nir_narrow) / (swir2 + nir_narrow) ** 0.5) + 1.0)
+
+def calculate_csi(nir, swir2):
+    return nir / swir2
+
+def calculate_mirbi(swir1, swir2):
+    return 10.0 * swir2 - 9.8 * swir1 + 2.0
+
+def calculate_nbr(nir, swir2):
+    return (nir - swir2) / (nir + swir2)
+
+def calculate_nbr2(swir1, swir2):
+    return (swir1 - swir2) / (swir1 + swir2)
+
+def calculate_nbrswir(swir1, swir2):
+    return (swir2 - swir1 - 0.02) / (swir2 + swir1 + 0.1)
+
+def calculate_nbrplus(blue, green, nir_narrow, swir2):
+    return (swir2 - nir_narrow - green - blue) / (swir2 + nir_narrow + green + blue)
+
+def calculate_ndswir(nir, swir1):
+    return (nir - swir1) / (nir + swir1)
+
+# Water
+
+def calculate_ndwi(b, g, r, n, s1, s2):
+    return (b + g + r - n - s1 - s2) / (b + g + r + n + s1 + s2)
+
+def calculate_aweinsh(g, n, s1, s2):
+    return 4.0 * (g - s1) - 0.25 * n + 2.75 * s2
+
+def calculate_aweish(b, g, n, s1, s2):
+    return b + 2.5 * g - 1.5 * (n + s1) - 0.25 * s2
+
+def calculate_lswi(n, s1):
+    return (n - s1) / (n + s1)
+
+def calculate_mlswi26(n, s1):
+    return (1.0 - n - s1) / (1.0 - n + s1)
+
+def calculate_mlswi27(n, s2):
+    return (1.0 - n - s2) / (1.0 - n + s2)
+
+def calculate_mndwi(g, s1):
+    return (g - s1) / (g + s1)
+
+def calculate_muwir(b, g, r, n, s1, s2):
+    return (-4.0 * ((b - g) / (b + g)) 
+            + 2.0 * ((g - n) / (g + n)) 
+            + 2.0 * ((g - s2) / (g + s2)) 
+            - ((g - s1) / (g + s1)))
+
+def calculate_ndci(re1, r):
+    return (re1 - r) / (re1 + r)
+
+def calculate_ndponi(g, s1):
+    return (s1 - g) / (s1 + g)
+
+def calculate_ndti(r, g):
+    return (r - g) / (r + g)
+
+def calculate_ndvimndwi(g, r, n, s1):
+    return ((n - r) / (n + r)) - ((g - s1) / (g + s1))
+
+def calculate_ndwi_simple(g, n):
+    return (g - n) / (g + n)
+
+def calculate_ndwins(g, n, alpha):
+    return (g - alpha * n) / (g + n)
+
+def calculate_nsdsi1(s1, s2):
+    return (s1 - s2) / s1
+
+def calculate_nsdsi2(s1, s2):
+    return (s1 - s2) / s2
+
+def calculate_nsdsi3(s1, s2):
+    return (s1 - s2) / (s1 + s2)
+
+def calculate_nwi(b, n, s1, s2):
+    return (b - (n + s1 + s2)) / (b + (n + s1 + s2))
+
+def calculate_s2wi(re1, s2):
+    return (re1 - s2) / (re1 + s2)
+
+def calculate_swm(b, g, n, s1):
+    return (b + g) / (n + s1)
+
+def calculate_wi1(g, s2):
+    return (g - s2) / (g + s2)
+
+def calculate_wi2(b, s2):
+    return (b - s2) / (b + s2)
+
+def calculate_wri(g, r, n, s1):
+    return (g + r) / (n + s1)
+
+# Snow
+
+def calculate_nbsims(g, r, n, b, s1, s2):
+    return 0.36 * (g + r + n) - (((b + s2) / g) + s1)
+
+def calculate_ndglal(g, r):
+    return (g - r) / (g + r)
+
+def calculate_ndsi(g, s1):
+    return (g - s1) / (g + s1)
+
+def calculate_ndsii(g, n):
+    return (g - n) / (g + n)
+
+def calculate_ndsinw(g, s1, beta):
+    return (g - s1 - beta) / (g + s1)
+
+def calculate_ndsall(g, s1, beta):
+    return (g - s1 - beta) / (g + s1)
+
+def calculate_s3(n, r, s1):
+    return (n * (r - s1)) / ((n + r) * (n + s1))
+
+def calculate_swi(g, n, s1):
+    return (g * (n - s1)) / ((g + n) * (n + s1))
+
+# Urban
+
+def calculate_bi(b, g, r, n, s1, s2):
+    return ((s1 + r) - (n + b)) / ((s1 + r) + (n + b))
+
+def calculate_blfei(g, r, s1, s2):
+    return (((g + r + s2) / 3.0) - s1) / (((g + r + s2) / 3.0) + s1)
+
+def calculate_brba(r, s1):
+    return r / s1
+
+def calculate_bal(r, n, s1):
+    return r + s1 - n
+
+def calculate_dbsi(g, r, n, s1):
+    return ((s1 - g) / (s1 + g)) - ((n - r) / (n + r))
+
+def calculate_embi(g, s1, s2, n):
+    term1 = ((s1 - s2 - n) / (s1 + s2 + n)) + 0.5
+    term2 = ((g - s1) / (g + s1))
+    return (term1 - term2 - 0.5) / (term1 + term2 + 1.5)
+
+def calculate_ibi(g, r, n, s1, l):
+    term1 = (s1 - n) / (s1 + n)
+    term2 = ((n - r) * (1.0 + l) / (n + r + l)) + ((g - s1) / (g + s1)) / 2.0
+    return term1 / term2
+
+def calculate_mbi(s1, s2, n):
+    return ((s1 - s2 - n) / (s1 + s2 + n)) + 0.5
+
+def calculate_nmai(g, s1, s2):
+    return ((s2 - s1) / g) / ((s2 + s1) / g)
+
+def calculate_ndbi(n, s1):
+    return (s1 - n) / (s1 + n)
+
+def calculate_ndsoil(g, s2):
+    return (s2 - g) / (s2 + g)
+
+def calculate_nhfd(re1, a):
+    return (re1 - a) / (re1 + a)
+
+def calculate_nsds(s1, s2):
+    return (s1 - s2) / (s1 + s2)
+
+def calculate_pisi(b, n):
+    return 0.8192 * b - 0.5735 * n + 0.0750
+
+def calculate_ui(s2, n):
+    return (s2 - n) / (s2 + n)
+
+def calculate_vibi(r, n, s1):
+    term1 = (n - r) / (n + r)
+    term2 = (s1 - n) / (s1 + n)
+    return term1 / (term1 + term2)
+
+def calculate_vgnirbi(g, n):
+    return (g - n) / (g + n)
+
+def calculate_vrnirbi(r, n):
+    return (r - n) / (r + n)
