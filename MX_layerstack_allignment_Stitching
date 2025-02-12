@@ -461,8 +461,21 @@ for image_name, metadata in metadata_dict.items():
     # Convert pixel size from meters to degrees
     pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, metadata["latitude"])
 
+    # # Adjust geo-transform based on image center from metadata
+    # top_left_x = metadata["longitude"] - (pixel_size_long * ds.RasterXSize / 2)  # Left edge (longitude)
+    # top_left_y = metadata["latitude"] + (pixel_size_lat * ds.RasterYSize / 2)  # Top edge (latitude)
+    # Calculate georeferencing point based on the center of the rotated image
     center_x = metadata["longitude"] - (pixel_size_long * ds.RasterXSize / 2)
     center_y = metadata["latitude"] + (pixel_size_lat * ds.RasterYSize / 2)
+    
+    # new_geotransform = (
+    #     top_left_x,        # Top-left corner longitude
+    #     pixel_size_long,   # Pixel size in longitude direction
+    #     0,                 # No rotation (row rotation)
+    #     top_left_y,        # Top-left corner latitude
+    #     0,                 # No rotation (column rotation)
+    #     -pixel_size_lat    # Negative for north-down
+    # )
 
     new_geotransform = (
         center_x,        # Top-left corner longitude
@@ -642,6 +655,10 @@ for image_name, metadata in metadata_dict.items():
     # Convert pixel size from meters to degrees
     pixel_size_lat, pixel_size_long = convert_pixel_size_to_degrees(pixel_size_meters, metadata["latitude"])
 
+    # # Create the new geotransform based on the new rotated image size
+    # top_left_x = metadata["longitude"] - (pixel_size_long * rotated_image.shape[1] / 2)
+    # top_left_y = metadata["latitude"] + (pixel_size_lat * rotated_image.shape[0] / 2)
+
     # Calculate georeferencing point based on the center of the rotated image
     center_x = metadata["longitude"] - (pixel_size_long * rotated_image.shape[1] / 2)
     center_y = metadata["latitude"] + (pixel_size_lat * rotated_image.shape[0] / 2)
@@ -655,6 +672,46 @@ for image_name, metadata in metadata_dict.items():
         -pixel_size_lat     # Pixel size in latitude (negative for North-to-South)
     )
 
+    
+    # if heading_deg == 238:
+    #     # For return flight, georeference the bottom-right pixel
+    #     top_left_x = metadata["longitude"] + (pixel_size_long * rotated_image.shape[1])
+    #     top_left_y = metadata["latitude"] - (pixel_size_lat * rotated_image.shape[0])
+    # else:
+    #     # For forward flight, georeference the top-left pixel
+    #     top_left_x = metadata["longitude"] - (pixel_size_long * rotated_image.shape[1] / 2)
+    #     top_left_y = metadata["latitude"] + (pixel_size_lat * rotated_image.shape[0] / 2)
+    
+    # new_geotransform = (
+    #     top_left_x,
+    #     pixel_size_long,
+    #     0,
+    #     top_left_y,
+    #     0,
+    #     -pixel_size_lat
+    # )
+
+    
+    # heading_offset_x = 0.00001 if heading_deg == 238 else 0  # Example adjustment
+    # heading_offset_y = -0.00001 if heading_deg == 238 else 0  # Example adjustment
+    
+    # new_geotransform = (
+    #     top_left_x + heading_offset_x,
+    #     pixel_size_long,
+    #     0,
+    #     top_left_y + heading_offset_y,
+    #     0,
+    #     -pixel_size_lat
+    # )
+
+    # new_geotransform = (
+    #     top_left_x,
+    #     pixel_size_long,
+    #     0,
+    #     top_left_y,
+    #     0,
+    #     -pixel_size_lat
+    # )
 
     # Create the output dataset with the new dimensions
     driver = gdal.GetDriverByName("GTiff")
@@ -724,6 +781,34 @@ def match_features(des1, des2, max_matches=500):
     matches = sorted(matches, key=lambda x: x.distance)
     # Limit the number of matches to max_matches
     return matches[:max_matches]
+
+# # Function to apply transformation and get inlier percentage
+# def apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img):
+#     src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+#     dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    
+#     if transformation_type == 'homography':
+#         matrix, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+#         aligned_img = cv2.warpPerspective(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+#     elif transformation_type == 'affine':
+#         matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+#         aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+#     elif transformation_type == 'projective':
+#         matrix, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+#         aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+#     elif transformation_type == 'similarity':
+#         matrix, mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+#         aligned_img = cv2.warpAffine(img, matrix, (ref_img.shape[1], ref_img.shape[0]))
+#     else:
+#         raise ValueError("Unknown transformation type")
+    
+#     inliers = np.sum(mask)
+#     total_matches = len(matches)
+#     inlier_percentage = (inliers / total_matches) * 100 if total_matches > 0 else 0
+    
+#     print(f"Total matches: {total_matches}, Inliers: {inliers}, Inlier percentage: {inlier_percentage:.2f}%")
+    
+#     return aligned_img, inlier_percentage
 
 def apply_transformation_with_save(kp1, kp2, matches, transformation_type, img, ref_img, band_name, output_folder):
     """Apply transformation, calculate inlier percentage, and save the warp matrix."""
@@ -802,6 +887,50 @@ def save_as_rasterio_tiff(blue, green, red, red_edge, nir, output_path):
         dst.write(red_edge, 4)
         dst.write(nir, 5)
 
+# Main logic with adjustable max_matches
+# def process_bands(band_images, ref_img, image_names, max_matches=1500):
+#     aligned_images = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+#     inlier_percentages = {'homography': [], 'affine': [], 'projective': [], 'similarity': []}
+
+#     for i, img in enumerate(band_images):
+#         print(f"\nProcessing {image_names[i]} band...")
+
+#         # Detect keypoints and descriptors using ORB
+#         kp1, des1 = orb_keypoints_descriptors(img)
+#         kp2, des2 = orb_keypoints_descriptors(ref_img)
+
+#         # Display the keypoints
+#         draw_keypoints(img, kp1, f'{image_names[i]} Band Keypoints')
+#         draw_keypoints(ref_img, kp2, 'Reference (RedEdge) Keypoints')
+
+#         # Match features
+#         matches = match_features(des1, des2, max_matches)
+#         print(f"Total matches found between {image_names[i]} band and RedEdge: {len(matches)}")
+
+#         # Draw and display matches
+#         draw_matches(img, kp1, ref_img, kp2, matches, f'Matched Features - {image_names[i]} Band')
+
+#         # Apply transformations and calculate RMSE and inlier percentage
+#         for transformation_type in ['homography', 'affine', 'projective', 'similarity']:
+#             aligned_img, inlier_percentage = apply_transformation(kp1, kp2, matches, transformation_type, img, ref_img)
+#             aligned_images[transformation_type].append(aligned_img)
+#             inlier_percentages[transformation_type].append(inlier_percentage)
+
+#             # Compute and print RMSE
+#             rmse = calculate_rmse(aligned_img, ref_img)
+#             print(f"RMSE after {transformation_type.capitalize()} Transformation: {rmse:.4f}")
+
+#             # Display the transformed image alongside the reference for visual inspection
+#             plt.figure(figsize=(10, 5))
+#             plt.subplot(1, 2, 1)
+#             plt.imshow(ref_img, cmap='gray')
+#             plt.title("Reference (RedEdge)")
+
+#             plt.subplot(1, 2, 2)
+#             plt.imshow(aligned_img, cmap='gray')
+#             plt.title(f'Aligned {image_names[i]} Band ({transformation_type.capitalize()})')
+
+#             plt.show()
 
 def process_bands_with_save(band_images, ref_img, image_names, output_folder, max_matches=1500):
     """Process bands, save aligned images, and store warp matrices."""
@@ -913,6 +1042,10 @@ save_as_rasterio_tiff(
     'C:\\Tarun\\CIFA_ponds\\0000SET\\allignment_test\\aligned\\test.tif'
 )
 
+
+# In[27]:
+
+
 #Warp multiple files using a stored warp matrix
 # working
 
@@ -978,6 +1111,17 @@ def crop_to_valid_pixels(aligned_images):
     cropped_images = [img[row_min:row_max+1, col_min:col_max+1] for img in aligned_images]
     return cropped_images
 
+# Function to load precomputed warp matrices
+# def load_warp_matrices(folder, transformation_type, band_names):
+#     warp_matrices = {}
+#     for band_name in band_names:
+#         matrix_file = os.path.join(folder, f"{band_name}_{transformation_type}_warp_matrix.json")
+#         if not os.path.exists(matrix_file):
+#             raise FileNotFoundError(f"Warp matrix file not found: {matrix_file}")
+#         with open(matrix_file, "r") as f:
+#             warp_matrices[band_name] = np.array(json.load(f))
+#     return warp_matrices
+
 def load_warp_matrices(folder, transformation_type, band_names, ref_band_name):
     """Load warp matrices for bands except the reference band."""
     warp_matrices = {}
@@ -1003,6 +1147,52 @@ def align_bands_with_matrices(band_images, warp_matrices, ref_img_shape, band_na
         aligned_band = cv2.warpAffine(img, warp_matrix[:2], (ref_img_shape[1], ref_img_shape[0]), flags=cv2.INTER_LINEAR)
         aligned_bands.append(aligned_band)
     return aligned_bands
+
+# Main function to process multiple image sets
+# def process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band_index=4, transformation_type='affine'):
+#     os.makedirs(output_folder, exist_ok=True)
+
+#     # Define band names and order
+#     band_names = ['Blue', 'Green', 'Red', 'RedEdge', 'NIR']
+#     band_order = [1, 2, 3, 5, 4]  # Corresponding file suffixes
+
+#     # Load warp matrices
+#     warp_matrices = load_warp_matrices(warp_matrix_folder, transformation_type, band_names)
+
+#     # Find all image sets in the folder
+#     capture_sets = find_capture_sets(input_folder)
+#     if not capture_sets:
+#         raise ValueError("No capture sets found in the input folder.")
+
+#     # Process each image set
+#     for set_name, set_files in capture_sets.items():
+#         print(f"Processing set: {set_name}")
+
+#         if not all(band in set_files for band in band_order):
+#             print(f"Skipping set {set_name} due to missing bands.")
+#             continue
+
+#         # Load all bands
+#         band_images = [load_tif(set_files[band]) for band in band_order]
+#         ref_img = band_images[ref_band_index - 1]  # Use the specified band as reference
+
+#         # Align bands using precomputed matrices
+#         aligned_bands = align_bands_with_matrices(band_images, warp_matrices, ref_img.shape, band_names)
+
+#         # Crop to valid region
+#         aligned_bands_cropped = crop_to_valid_pixels(aligned_bands)
+
+#         # Save as layerstacked GeoTIFF
+#         output_path = os.path.join(output_folder, f"{set_name}_stacked.tif")
+#         save_as_rasterio_tiff(
+#             aligned_bands_cropped[0],  # Blue
+#             aligned_bands_cropped[1],  # Green
+#             aligned_bands_cropped[2],  # Red
+#             aligned_bands_cropped[3],  # RedEdge
+#             aligned_bands_cropped[4],  # NIR
+#             output_path
+#         )
+#         print(f"Saved layerstacked image to: {output_path}")
 
 def process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band_index=4, transformation_type='affine'):
     os.makedirs(output_folder, exist_ok=True)
@@ -1060,6 +1250,14 @@ def process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band
         )
         print(f"Saved layerstacked image to: {output_path}")
 
+
+# # Input and Output Folders
+# input_folder = "C:/Tarun/CIFA_ponds/0000SET/allignment_test/unrotated"
+# warp_matrix_folder = "C:/Tarun/CIFA_ponds/0000SET/aligned/warp_matrices"
+# output_folder = "C:/Tarun/CIFA_ponds/0000SET/alignment_test/aligned_output"
+
+# # Run the processing
+# process_image_sets(input_folder, output_folder, warp_matrix_folder, ref_band_index=4, transformation_type='affine')
 
 # Input and Output Folders
 #input_folder = "C:/Tarun/CIFA_ponds/0000SET/allignment_test/unrotated"
